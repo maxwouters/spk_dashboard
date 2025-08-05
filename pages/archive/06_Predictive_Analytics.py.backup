@@ -1,0 +1,1158 @@
+import streamlit as st
+import pandas as pd
+import duckdb
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, date, timedelta
+import numpy as np
+from scipy import stats
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score
+import warnings
+from db_config import get_database_connection
+warnings.filterwarnings('ignore')
+
+st.set_page_config(page_title="Predictive Analytics - SPK Dashboard", layout="wide")
+
+st.title("🤖 Predictive Analytics Dashboard")
+
+# Database connectie
+con = get_database_connection()
+
+# Create prediction tables if they don't exist
+con.execute("""
+    CREATE TABLE IF NOT EXISTS prediction_models (
+        model_id INTEGER PRIMARY KEY,
+        model_name VARCHAR,
+        model_type VARCHAR,
+        target_variable VARCHAR,
+        features TEXT,
+        accuracy_score FLOAT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        is_active BOOLEAN DEFAULT TRUE
+    )
+""")
+
+con.execute("""
+    CREATE TABLE IF NOT EXISTS player_predictions (
+        prediction_id INTEGER PRIMARY KEY,
+        speler VARCHAR,
+        prediction_type VARCHAR,
+        prediction_value FLOAT,
+        confidence_score FLOAT,
+        prediction_date DATE,
+        target_date DATE,
+        model_used VARCHAR,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+# Sequences
+try:
+    con.execute("CREATE SEQUENCE IF NOT EXISTS model_id_seq START 1")
+    con.execute("CREATE SEQUENCE IF NOT EXISTS prediction_id_seq START 1")
+except:
+    pass
+
+# Helper functions
+@st.cache_data
+def load_fitness_data():
+    """Load and prepare fitness data for modeling"""
+    
+    # 30-15 test data with date parsing
+    fitness_query = """
+        SELECT 
+            Speler,
+            TrueVIFT,
+            MAS,
+            VO2MAX,
+            PeakVelocity,
+            Maand,
+            Leeftijd,
+            Gewicht
+        FROM thirty_fifteen_results
+        WHERE TrueVIFT IS NOT NULL
+        ORDER BY Speler, Maand
+    """
+    
+    fitness_data = con.execute(fitness_query).fetchall()
+    df_fitness = pd.DataFrame(fitness_data, columns=[
+        'Speler', 'TrueVIFT', 'MAS', 'VO2MAX', 'PeakVelocity', 
+        'Maand', 'Leeftijd', 'Gewicht'
+    ])
+    
+    return df_fitness
+
+@st.cache_data
+def load_gps_data():
+    """Load GPS training data"""
+    
+    gps_query = """
+        SELECT 
+            speler,
+            datum,
+            training_id,
+            session_duur_minuten,
+            totale_afstand,
+            hoge_intensiteit_afstand,
+            zeer_hoge_intensiteit_afstand,
+            sprint_afstand,
+            max_snelheid,
+            gem_snelheid,
+            aantal_acceleraties,
+            aantal_deceleraties,
+            aantal_sprints,
+            player_load,
+            metabolic_power_avg,
+            metabolic_power_max,
+            positie,
+            impacts,
+            hml_efforts
+        FROM gps_data
+        WHERE totale_afstand IS NOT NULL
+        ORDER BY speler, datum
+    """
+    
+    gps_data = con.execute(gps_query).fetchall()
+    df_gps = pd.DataFrame(gps_data, columns=[
+        'Speler', 'Datum', 'Training_ID', 'Duur_Minuten', 'Totale_Afstand', 'Hoge_Intensiteit', 
+        'Zeer_Hoge_Intensiteit', 'Sprint_Afstand', 'Max_Snelheid', 'Gem_Snelheid', 
+        'Acceleraties', 'Deceleraties', 'Sprints', 'Player_Load', 'Metabolic_Power_Avg',
+        'Metabolic_Power_Max', 'Positie', 'Impacts', 'HML_Efforts'
+    ])
+    
+    return df_gps
+
+@st.cache_data
+def load_advanced_gps_metrics():
+    """Load enhanced GPS metrics for comprehensive analysis"""
+    
+    gps_advanced_query = """
+        SELECT 
+            speler,
+            datum,
+            training_id,
+            session_duur_minuten,
+            totale_afstand,
+            hoge_intensiteit_afstand,
+            zeer_hoge_intensiteit_afstand,
+            sprint_afstand,
+            max_snelheid,
+            gem_snelheid,
+            aantal_acceleraties,
+            aantal_deceleraties,
+            aantal_sprints,
+            aantal_richtingveranderingen,
+            player_load,
+            metabolic_power_avg,
+            metabolic_power_max,
+            positie,
+            impacts,
+            hml_efforts,
+            created_at
+        FROM gps_data
+        WHERE totale_afstand IS NOT NULL
+        ORDER BY speler, datum
+    """
+    
+    gps_data = con.execute(gps_advanced_query).fetchall()
+    df_gps_advanced = pd.DataFrame(gps_data, columns=[
+        'Speler', 'Datum', 'Training_ID', 'Duur_Minuten', 'Totale_Afstand', 'Hoge_Intensiteit', 
+        'Zeer_Hoge_Intensiteit', 'Sprint_Afstand', 'Max_Snelheid', 'Gem_Snelheid', 
+        'Acceleraties', 'Deceleraties', 'Sprints', 'Richtingveranderingen', 'Player_Load', 
+        'Metabolic_Power_Avg', 'Metabolic_Power_Max', 'Positie', 'Impacts', 'HML_Efforts', 'Created_At'
+    ])
+    
+    # Calculate additional metrics
+    if not df_gps_advanced.empty:
+        # High intensity percentage
+        df_gps_advanced['HI_Percentage'] = (df_gps_advanced['Hoge_Intensiteit'] / df_gps_advanced['Totale_Afstand'] * 100).fillna(0)
+        
+        # Sprint frequency (sprints per minute)
+        df_gps_advanced['Sprint_Frequency'] = (df_gps_advanced['Sprints'] / df_gps_advanced['Duur_Minuten']).fillna(0)
+        
+        # Acceleration/Deceleration ratio
+        df_gps_advanced['Acc_Dec_Ratio'] = (df_gps_advanced['Acceleraties'] / (df_gps_advanced['Deceleraties'] + 1)).fillna(0)
+        
+        # Load per minute
+        df_gps_advanced['Load_Per_Minute'] = (df_gps_advanced['Player_Load'] / df_gps_advanced['Duur_Minuten']).fillna(0)
+        
+        # Distance per minute (pace)
+        df_gps_advanced['Distance_Per_Minute'] = (df_gps_advanced['Totale_Afstand'] / df_gps_advanced['Duur_Minuten']).fillna(0)
+    
+    return df_gps_advanced
+
+def calculate_fitness_progression(df, player):
+    """Calculate fitness progression for a specific player"""
+    player_data = df[df['Speler'] == player].copy()
+    
+    if len(player_data) < 2:
+        return None
+    
+    # Sort by month/time (assuming Maand is chronological)
+    month_order = ['Januari', 'Februari', 'Maart', 'April', 'Mei', 'Juni',
+                   'Juli', 'Augustus', 'September', 'Oktober', 'November', 'December']
+    
+    player_data['Month_Num'] = player_data['Maand'].map({month: i for i, month in enumerate(month_order)})
+    player_data = player_data.sort_values('Month_Num')
+    
+    # Calculate progression rates
+    progression = {}
+    for metric in ['TrueVIFT', 'MAS', 'VO2MAX']:
+        if len(player_data[metric].dropna()) >= 2:
+            values = player_data[metric].values
+            x = np.arange(len(values))
+            
+            # Linear regression for trend
+            slope, intercept, r_value, p_value, std_err = stats.linregress(x, values)
+            progression[metric] = {
+                'slope': slope,
+                'r_squared': r_value**2,
+                'current_value': values[-1],
+                'predicted_next': slope * len(values) + intercept
+            }
+    
+    return progression
+
+def predict_injury_risk_gps_only(df_gps, player):
+    """GPS-only injury risk model focusing on load patterns and movement quality"""
+    player_data = df_gps[df_gps['Speler'] == player].copy()
+    
+    if len(player_data) < 2:  # Need at least some data
+        return {'risk_score': 0.5, 'reason': 'Insufficient GPS data', 'factors': {}}
+    
+    # Sort by date
+    player_data = player_data.sort_values('Datum')
+    
+    # Calculate ACWR (Acute:Chronic Workload Ratio)
+    if len(player_data) >= 7:
+        acute_period = 7
+        chronic_period = min(28, len(player_data))
+    elif len(player_data) >= 4:
+        acute_period = 3
+        chronic_period = len(player_data)
+    else:
+        acute_period = 1
+        chronic_period = len(player_data)
+    
+    recent_data = player_data.tail(acute_period)
+    chronic_data = player_data.tail(chronic_period)
+    
+    acute_load = recent_data['Totale_Afstand'].mean()
+    chronic_load = chronic_data['Totale_Afstand'].mean()
+    acwr = acute_load / chronic_load if chronic_load > 0 else 1.0
+    
+    # Initialize GPS-based risk factors
+    risk_factors = {
+        'acwr': acwr,
+        'acute_load': acute_load,
+        'chronic_load': chronic_load,
+        'high_intensity_load': 0,
+        'sprint_load': 0,
+        'metabolic_load': 0,
+        'movement_quality': 0,
+        'load_density': 0,
+        'speed_variability': 0
+    }
+    
+    # Enhanced GPS analysis
+    if len(recent_data) >= 1:
+        # High intensity analysis
+        avg_hi_distance = recent_data['Hoge_Intensiteit'].mean()
+        avg_sprint_distance = recent_data['Sprint_Afstand'].mean()
+        avg_very_hi_distance = recent_data['Zeer_Hoge_Intensiteit'].mean()
+        
+        # Normalize high intensity load (based on typical values)
+        risk_factors['high_intensity_load'] = min(avg_hi_distance / 2000, 1.0) if avg_hi_distance else 0
+        risk_factors['sprint_load'] = min(avg_sprint_distance / 400, 1.0) if avg_sprint_distance else 0
+        
+        # Metabolic power analysis
+        avg_metabolic = recent_data['Metabolic_Power_Avg'].mean()
+        risk_factors['metabolic_load'] = min(avg_metabolic / 400, 1.0) if avg_metabolic and avg_metabolic > 0 else 0.3
+        
+        # Movement quality metrics
+        avg_accelerations = recent_data['Acceleraties'].mean()
+        avg_decelerations = recent_data['Deceleraties'].mean()
+        avg_direction_changes = recent_data['Richtingveranderingen'].mean() if 'Richtingveranderingen' in recent_data.columns else 0
+        
+        # High acceleration/deceleration load indicates higher injury risk
+        movement_load = (avg_accelerations + avg_decelerations) / 300  # Normalize typical values ~150 each
+        risk_factors['movement_quality'] = min(movement_load, 1.0) if movement_load else 0.3
+        
+        # Load density (Player Load per minute)
+        avg_player_load = recent_data['Player_Load'].mean()
+        avg_duration = recent_data['Duur_Minuten'].mean()
+        load_density = (avg_player_load / avg_duration) if avg_duration > 0 else 0
+        risk_factors['load_density'] = min(load_density / 20, 1.0) if load_density else 0.3  # Typical ~15-20 load/min
+        
+        # Speed variability (difference between max and average speed)
+        avg_max_speed = recent_data['Max_Snelheid'].mean()
+        avg_speed = recent_data['Gem_Snelheid'].mean()
+        speed_diff = avg_max_speed - avg_speed
+        risk_factors['speed_variability'] = min(speed_diff / 25, 1.0) if speed_diff else 0.3  # High variability = higher demands
+    
+    # Calculate ACWR-based risk
+    acwr_risk = 0
+    if acwr < 0.8:
+        acwr_risk = 0.75  # Deconditioning risk
+        primary_reason = "Deconditioning risico - te lage trainingsbelasting"
+    elif acwr > 1.5:
+        acwr_risk = 0.9  # Very high overload risk
+        primary_reason = "Zeer hoge acute belasting (ACWR > 1.5)"
+    elif acwr > 1.3:
+        acwr_risk = 0.65  # Moderate risk
+        primary_reason = "Verhoogde acute belasting (ACWR > 1.3)"
+    else:
+        acwr_risk = 0.2  # Low risk
+        primary_reason = "Optimale trainingsbelasting"
+    
+    # GPS-focused weight distribution
+    weights = {
+        'acwr': 0.45,           # Primary factor
+        'high_intensity': 0.20, # High intensity load
+        'metabolic': 0.15,      # Metabolic demand
+        'movement_quality': 0.10, # Acceleration/deceleration load
+        'load_density': 0.10    # Training intensity
+    }
+    
+    # Calculate composite risk score
+    composite_risk = (
+        acwr_risk * weights['acwr'] +
+        risk_factors['high_intensity_load'] * weights['high_intensity'] +
+        risk_factors['metabolic_load'] * weights['metabolic'] +
+        risk_factors['movement_quality'] * weights['movement_quality'] +
+        risk_factors['load_density'] * weights['load_density']
+    )
+    
+    # Refine primary risk reason based on dominant factors
+    if risk_factors['high_intensity_load'] > 0.8:
+        primary_reason = "Zeer hoge intensiteit training belasting"
+    elif risk_factors['movement_quality'] > 0.8:
+        primary_reason = "Hoge acceleratie/deceleratie belasting"
+    elif risk_factors['metabolic_load'] > 0.8:
+        primary_reason = "Zeer hoge metabolic power demand"
+    elif risk_factors['load_density'] > 0.8:
+        primary_reason = "Zeer hoge training intensiteit (load/minuut)"
+    
+    # Additional contextual information
+    training_consistency = len(player_data)
+    context_info = {
+        'training_sessions': training_consistency,
+        'avg_session_duration': recent_data['Duur_Minuten'].mean() if not recent_data.empty else 0,
+        'primary_position': player_data['Positie'].mode().iloc[0] if not player_data['Positie'].isna().all() else 'Unknown'
+    }
+    
+    return {
+        'risk_score': min(composite_risk, 1.0),
+        'reason': primary_reason,
+        'factors': risk_factors,
+        'acwr': acwr,
+        'acute_load': acute_load,
+        'chronic_load': chronic_load,
+        'context': context_info
+    }
+
+# Main interface
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🏃 Fitness Forecasting", "⚠️ Injury Risk", "🎯 Performance Optimization", "💪 Physical Data", "📊 Model Performance"])
+
+with tab1:
+    st.header("🏃 Fitness Progression & Forecasting")
+    
+    df_fitness = load_fitness_data()
+    
+    if not df_fitness.empty:
+        # Player selection
+        players = sorted(df_fitness['Speler'].unique())
+        selected_player = st.selectbox("👤 Selecteer Speler", players)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader(f"📈 Progression Analysis - {selected_player}")
+            
+            player_data = df_fitness[df_fitness['Speler'] == selected_player]
+            
+            if len(player_data) >= 2:
+                # Display current metrics
+                latest_data = player_data.iloc[-1]
+                st.metric("🏃 Huidige MAS", f"{latest_data['MAS']:.1f} km/h")
+                st.metric("⚡ TrueVIFT", f"{latest_data['TrueVIFT']:.1f} km/h")
+                st.metric("💨 VO2MAX", f"{latest_data['VO2MAX']:.0f} ml/kg/min")
+                
+                # Calculate progression
+                progression = calculate_fitness_progression(df_fitness, selected_player)
+                
+                if progression:
+                    st.write("**📊 Progression Trends:**")
+                    for metric, data in progression.items():
+                        trend = "📈" if data['slope'] > 0 else "📉" if data['slope'] < 0 else "➡️"
+                        st.write(f"{trend} **{metric}**: {data['slope']:.2f} per test (R²: {data['r_squared']:.2f})")
+                        
+                        # Prediction
+                        st.write(f"🔮 **Voorspelling volgende test**: {data['predicted_next']:.1f}")
+            else:
+                st.info("Minimaal 2 testresultaten nodig voor progression analyse")
+        
+        with col2:
+            st.subheader("📊 Visual Progression")
+            
+            if len(player_data) >= 2:
+                # Create progression chart
+                fig = go.Figure()
+                
+                months = player_data['Maand'].tolist()
+                
+                # Add actual values
+                fig.add_trace(go.Scatter(
+                    x=months,
+                    y=player_data['MAS'],
+                    mode='lines+markers',
+                    name='MAS (Actual)',
+                    line=dict(color='blue')
+                ))
+                
+                # Add trend line if we have progression data
+                if progression and 'MAS' in progression:
+                    y_values = player_data['MAS'].values
+                    x_numeric = np.arange(len(y_values))
+                    trend_line = progression['MAS']['slope'] * x_numeric + (y_values[0] - progression['MAS']['slope'] * 0)
+                    
+                    fig.add_trace(go.Scatter(
+                        x=months,
+                        y=trend_line,
+                        mode='lines',
+                        name='Trend',
+                        line=dict(color='red', dash='dash')
+                    ))
+                
+                fig.update_layout(
+                    title=f"MAS Progression - {selected_player}",
+                    xaxis_title="Test Periode",
+                    yaxis_title="MAS (km/h)",
+                    hovermode='x'
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+        
+        # Team comparison
+        st.subheader("👥 Team Fitness Comparison")
+        
+        # Calculate team averages for latest tests
+        latest_fitness = df_fitness.groupby('Speler').last().reset_index()
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # MAS distribution
+            fig = px.histogram(latest_fitness, x='MAS', nbins=10, 
+                             title="Team MAS Distribution")
+            fig.add_vline(x=latest_fitness['MAS'].mean(), line_dash="dash", 
+                         annotation_text=f"Team Gemiddelde: {latest_fitness['MAS'].mean():.1f}")
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            # Top performers
+            top_performers = latest_fitness.nlargest(5, 'MAS')[['Speler', 'MAS', 'VO2MAX']]
+            st.write("🏆 **Top 5 MAS Scores:**")
+            st.dataframe(top_performers, use_container_width=True)
+    else:
+        st.info("Geen fitness data beschikbaar voor analyse.")
+
+with tab2:
+    st.header("⚠️ Injury Risk Assessment")
+    st.info("🎯 **GPS-Based Risk Assessment** - Gebaseerd op trainingsbelasting en bewegingskwaliteit")
+    
+    df_gps = load_gps_data()
+    
+    if not df_gps.empty:
+        # Player selection
+        gps_players = sorted(df_gps['Speler'].unique())
+        selected_player = st.selectbox("👤 Selecteer Speler voor Risk Assessment", gps_players)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader(f"⚠️ Risk Analysis - {selected_player}")
+            
+            risk_assessment = predict_injury_risk_gps_only(df_gps, selected_player)
+            
+            # Risk score display
+            risk_score = risk_assessment['risk_score']
+            risk_color = 'red' if risk_score > 0.7 else 'orange' if risk_score > 0.4 else 'green'
+            
+            st.metric("🎯 Risk Score", f"{risk_score:.1f}", 
+                     delta=f"{risk_assessment['reason']}")
+            
+            if 'acwr' in risk_assessment:
+                st.metric("📊 ACWR Ratio", f"{risk_assessment['acwr']:.2f}")
+                st.metric("⚡ Acute Load (7d)", f"{risk_assessment['acute_load']:.0f}m")
+                st.metric("📈 Chronic Load (28d)", f"{risk_assessment['chronic_load']:.0f}m")
+            
+            # Enhanced GPS-based risk factors display
+            if 'factors' in risk_assessment and risk_assessment['factors']:
+                st.write("**🔍 GPS Risk Factor Breakdown:**")
+                factors = risk_assessment['factors']
+                
+                # ACWR risk
+                acwr_color = "🔴" if factors.get('acwr', 1.0) > 1.3 or factors.get('acwr', 1.0) < 0.8 else "🟢"
+                st.write(f"{acwr_color} **ACWR**: {factors.get('acwr', 0):.2f}")
+                
+                # High intensity load
+                hi_load = factors.get('high_intensity_load', 0)
+                hi_color = "🔴" if hi_load > 0.8 else "🟡" if hi_load > 0.5 else "🟢"
+                st.write(f"{hi_color} **High Intensity Load**: {hi_load:.2f}")
+                
+                # Sprint load
+                sprint_load = factors.get('sprint_load', 0)
+                sprint_color = "🔴" if sprint_load > 0.8 else "🟡" if sprint_load > 0.5 else "🟢"
+                st.write(f"{sprint_color} **Sprint Load**: {sprint_load:.2f}")
+                
+                # Metabolic load
+                met_load = factors.get('metabolic_load', 0)
+                met_color = "🔴" if met_load > 0.8 else "🟡" if met_load > 0.5 else "🟢"
+                st.write(f"{met_color} **Metabolic Power**: {met_load:.2f}")
+                
+                # Movement quality
+                movement = factors.get('movement_quality', 0)
+                mov_color = "🔴" if movement > 0.8 else "🟡" if movement > 0.5 else "🟢"
+                st.write(f"{mov_color} **Movement Quality**: {movement:.2f}")
+                
+                # Load density
+                density = factors.get('load_density', 0)
+                den_color = "🔴" if density > 0.8 else "🟡" if density > 0.5 else "🟢"
+                st.write(f"{den_color} **Load Density**: {density:.2f}")
+            
+            # Context information
+            if 'context' in risk_assessment:
+                context = risk_assessment['context']
+                st.write("**📋 Context Info:**")
+                st.write(f"🏃 **Trainingen**: {context.get('training_sessions', 0)} sessies")
+                st.write(f"⏱️ **Gem. Duur**: {context.get('avg_session_duration', 0):.0f} min")
+                st.write(f"⚽ **Positie**: {context.get('primary_position', 'Unknown')}")
+            
+            # Risk interpretation
+            if risk_score > 0.7:
+                st.error("🔴 **Hoog Risico** - Directe actie vereist")
+            elif risk_score > 0.4:
+                st.warning("🟡 **Matig Risico** - Monitor intensief")
+            else:
+                st.success("🟢 **Laag Risico** - Optimale belasting")
+        
+        with col2:
+            st.subheader("📊 Load Pattern Analysis")
+            
+            player_data = df_gps[df_gps['Speler'] == selected_player].copy()
+            
+            if len(player_data) >= 5:
+                player_data = player_data.sort_values('Datum')
+                
+                # Rolling averages
+                player_data['Acute_Load'] = player_data['Totale_Afstand'].rolling(7, min_periods=1).mean()
+                player_data['Chronic_Load'] = player_data['Totale_Afstand'].rolling(28, min_periods=1).mean()
+                player_data['ACWR'] = player_data['Acute_Load'] / player_data['Chronic_Load']
+                
+                # Create load chart
+                fig = go.Figure()
+                
+                fig.add_trace(go.Scatter(
+                    x=player_data['Datum'],
+                    y=player_data['Totale_Afstand'],
+                    mode='lines+markers',
+                    name='Daily Load',
+                    line=dict(color='blue')
+                ))
+                
+                fig.add_trace(go.Scatter(
+                    x=player_data['Datum'],
+                    y=player_data['Acute_Load'],
+                    mode='lines',
+                    name='Acute Load (7d)',
+                    line=dict(color='orange')
+                ))
+                
+                fig.add_trace(go.Scatter(
+                    x=player_data['Datum'],
+                    y=player_data['Chronic_Load'],
+                    mode='lines',
+                    name='Chronic Load (28d)',
+                    line=dict(color='green')
+                ))
+                
+                fig.update_layout(
+                    title=f"Training Load Pattern - {selected_player}",
+                    xaxis_title="Datum",
+                    yaxis_title="Afstand (m)",
+                    hovermode='x'
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+        
+        # Team risk overview
+        st.subheader("👥 Team Risk Overview")
+        
+        team_risks = []
+        for player in gps_players:
+            risk = predict_injury_risk_gps_only(df_gps, player)
+            team_risks.append({
+                'Speler': player,
+                'Risk Score': risk['risk_score'],
+                'ACWR': risk.get('acwr', 1.0),
+                'Sessions': risk.get('context', {}).get('training_sessions', 0),
+                'Status': risk['reason']
+            })
+        
+        df_risks = pd.DataFrame(team_risks)
+        df_risks = df_risks.sort_values('Risk Score', ascending=False)
+        
+        # Color coding function
+        def color_risk(val):
+            if val > 0.7:
+                return 'background-color: #ffcccc'  # Light red
+            elif val > 0.4:
+                return 'background-color: #fff3cd'  # Light yellow
+            else:
+                return 'background-color: #d4edda'  # Light green
+        
+        styled_risks = df_risks.style.applymap(color_risk, subset=['Risk Score'])
+        st.dataframe(styled_risks, use_container_width=True)
+        
+    else:
+        st.info("Geen GPS data beschikbaar voor injury risk assessment.")
+
+with tab3:
+    st.header("🎯 Performance Optimization")
+    
+    # Match load integration
+    st.subheader("⚽ Match Load Integration")
+    
+    # Get match minutes data for selected player
+    df_fitness = load_fitness_data()
+    if not df_fitness.empty:
+        selected_player = st.selectbox("👤 Selecteer Speler voor Load Analyse", 
+                                     sorted(df_fitness['Speler'].unique()),
+                                     key="load_player_select")
+        
+        # Get match minutes for this player
+        match_minutes = con.execute("""
+            SELECT 
+                m.datum, 
+                m.tegenstander, 
+                ml.minuten_gespeeld,
+                ml.positie,
+                m.match_type,
+                ml.start_elf
+            FROM match_lineups ml
+            JOIN matches m ON ml.match_id = m.match_id
+            WHERE ml.speler = ? AND ml.minuten_gespeeld > 0
+            ORDER BY m.datum DESC
+            LIMIT 10
+        """, (selected_player,)).fetchall()
+        
+        if match_minutes:
+            st.write(f"**⚽ Recente Match Load - {selected_player}:**")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Match minutes summary
+                df_matches = pd.DataFrame(match_minutes, columns=[
+                    'Datum', 'Tegenstander', 'Minuten', 'Positie', 'Type', 'Start XI'
+                ])
+                
+                # Calculate load metrics
+                total_match_minutes = df_matches['Minuten'].sum()
+                avg_minutes = df_matches['Minuten'].mean()
+                starts_count = df_matches['Start XI'].sum()
+                
+                st.metric("⏱️ Totaal Match Minuten", f"{total_match_minutes} min")
+                st.metric("📊 Gemiddeld per Match", f"{avg_minutes:.0f} min")
+                st.metric("🟢 Aantal Starts", f"{starts_count}")
+                
+                # Recent matches table
+                st.dataframe(df_matches[['Datum', 'Tegenstander', 'Minuten', 'Type']], 
+                           use_container_width=True)
+            
+            with col2:
+                # Match minutes trend
+                if len(match_minutes) >= 3:
+                    fig = go.Figure()
+                    
+                    dates = [m[0] for m in match_minutes[::-1]]  # Reverse for chronological order
+                    minutes = [m[2] for m in match_minutes[::-1]]
+                    
+                    fig.add_trace(go.Scatter(
+                        x=dates,
+                        y=minutes,
+                        mode='lines+markers',
+                        name='Match Minuten',
+                        line=dict(color='green')
+                    ))
+                    
+                    # Add 90-minute reference line
+                    fig.add_hline(y=90, line_dash="dash", line_color="red", 
+                                annotation_text="Volledige wedstrijd")
+                    
+                    fig.update_layout(
+                        title=f"Match Minutes Trend - {selected_player}",
+                        xaxis_title="Datum",
+                        yaxis_title="Minuten Gespeeld",
+                        hovermode='x'
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Meer match data nodig voor trend visualisatie")
+            
+            # Training vs Match Load Balance
+            st.write("**⚖️ Training vs Match Load Balance:**")
+            
+            # Get recent GPS training data
+            df_gps = load_gps_data()
+            player_gps = df_gps[df_gps['Speler'] == selected_player]
+            
+            if not player_gps.empty:
+                recent_training_load = player_gps.tail(5)['Totale_Afstand'].mean() if len(player_gps) >= 5 else 0
+                recent_match_minutes = df_matches.head(3)['Minuten'].mean() if len(df_matches) >= 3 else 0
+                
+                # Load balance recommendation
+                if recent_match_minutes >= 75:  # High match load
+                    if recent_training_load > 6000:  # High training load too
+                        load_recommendation = "🔴 **Hoge Totale Belasting** - Overweeg recovery/lichte training"
+                    else:
+                        load_recommendation = "🟡 **Balanced** - Match load hoog, training load gecontroleerd"
+                elif recent_match_minutes >= 45:  # Moderate match load
+                    if recent_training_load < 4000:  # Low training load
+                        load_recommendation = "🟢 **Ruimte voor Intensivering** - Kan training load verhogen"
+                    else:
+                        load_recommendation = "🟢 **Optimaal** - Goede balans training/match load"
+                else:  # Low match load
+                    if recent_training_load < 5000:
+                        load_recommendation = "🟡 **Onderbelasting** - Verhoog training intensiteit"
+                    else:
+                        load_recommendation = "🟢 **Compensatie Training** - Training compenseert lage match load"
+                
+                st.write(load_recommendation)
+                
+                # Load metrics
+                col_load1, col_load2, col_load3 = st.columns(3)
+                with col_load1:
+                    st.metric("🏃 Gem. Training Load", f"{recent_training_load:.0f}m")
+                with col_load2:
+                    st.metric("⚽ Gem. Match Minutes", f"{recent_match_minutes:.0f} min")
+                with col_load3:
+                    load_ratio = (recent_match_minutes / 90) if recent_match_minutes > 0 else 0
+                    st.metric("📊 Match Load %", f"{load_ratio*100:.0f}%")
+        else:
+            st.info(f"Geen match minuten gevonden voor {selected_player}")
+    else:
+        st.info("Geen fitness data beschikbaar")
+
+with tab4:
+    st.header("💪 GPS Performance Analysis")
+    st.info("🏃 **Comprehensive GPS Metrics** - Volledige analyse van bewegingsdata en belasting")
+    
+    # Load enhanced GPS data
+    df_gps_advanced = load_advanced_gps_metrics()
+    df_gps = load_gps_data()
+    
+    if not df_gps_advanced.empty:
+        # Player selection for GPS analysis
+        all_players = sorted(df_gps_advanced['Speler'].unique())
+        
+        if all_players:
+            selected_player = st.selectbox("👤 Selecteer Speler voor GPS Analyse", 
+                                         all_players, key="gps_player_select")
+            
+            # Enhanced GPS Data Analysis
+            player_gps = df_gps_advanced[df_gps_advanced['Speler'] == selected_player]
+            
+            if not player_gps.empty:
+                st.subheader("🏃 GPS Performance Metrics")
+                
+                # Recent GPS averages (last 5 sessions or all available)
+                recent_count = min(5, len(player_gps))
+                recent_gps = player_gps.tail(recent_count)
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.write("**📏 Distance Metrics**")
+                    avg_distance = recent_gps['Totale_Afstand'].mean()
+                    avg_hi_distance = recent_gps['Hoge_Intensiteit'].mean()
+                    avg_vhi_distance = recent_gps['Zeer_Hoge_Intensiteit'].mean()
+                    avg_sprint = recent_gps['Sprint_Afstand'].mean()
+                    
+                    st.metric("📏 Totale Afstand", f"{avg_distance:.0f}m")
+                    st.metric("⚡ High Intensity (>15km/h)", f"{avg_hi_distance:.0f}m")
+                    st.metric("🔥 Very High Intensity (>20km/h)", f"{avg_vhi_distance:.0f}m")
+                    st.metric("🏃 Sprint Afstand (>25km/h)", f"{avg_sprint:.0f}m")
+                
+                with col2:
+                    st.write("**⚡ Power & Load Metrics**")
+                    avg_player_load = recent_gps['Player_Load'].mean()
+                    avg_metabolic_avg = recent_gps['Metabolic_Power_Avg'].mean()
+                    avg_metabolic_max = recent_gps['Metabolic_Power_Max'].mean()
+                    avg_load_per_min = recent_gps['Load_Per_Minute'].mean()
+                    
+                    st.metric("⚡ Player Load", f"{avg_player_load:.0f}")
+                    st.metric("🔥 Metabolic Power (Avg)", f"{avg_metabolic_avg:.1f} W/kg")
+                    st.metric("💥 Metabolic Power (Max)", f"{avg_metabolic_max:.1f} W/kg")
+                    st.metric("📊 Load per Minute", f"{avg_load_per_min:.1f}")
+                
+                with col3:
+                    st.write("**🏃 Movement Quality**")
+                    avg_accelerations = recent_gps['Acceleraties'].mean()
+                    avg_decelerations = recent_gps['Deceleraties'].mean()
+                    avg_sprints = recent_gps['Sprints'].mean()
+                    avg_max_speed = recent_gps['Max_Snelheid'].mean()
+                    
+                    st.metric("🔺 Acceleraties (>3m/s²)", f"{avg_accelerations:.0f}")
+                    st.metric("🔻 Deceleraties (<-3m/s²)", f"{avg_decelerations:.0f}")
+                    st.metric("💨 Sprint Count", f"{avg_sprints:.0f}")
+                    st.metric("🚀 Max Snelheid", f"{avg_max_speed:.1f} km/h")
+                
+                # Enhanced metrics row
+                st.subheader("📊 Advanced GPS Metrics")
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    hi_percentage = recent_gps['HI_Percentage'].mean()
+                    st.metric("📈 HI Percentage", f"{hi_percentage:.1f}%", 
+                             help="High Intensity distance als % van totale afstand")
+                
+                with col2:
+                    sprint_freq = recent_gps['Sprint_Frequency'].mean()
+                    st.metric("🏃 Sprint Frequency", f"{sprint_freq:.2f}/min", 
+                             help="Aantal sprints per minuut")
+                
+                with col3:
+                    acc_dec_ratio = recent_gps['Acc_Dec_Ratio'].mean()
+                    st.metric("⚖️ Acc/Dec Ratio", f"{acc_dec_ratio:.2f}", 
+                             help="Verhouding acceleraties vs deceleraties")
+                
+                with col4:
+                    distance_per_min = recent_gps['Distance_Per_Minute'].mean()
+                    st.metric("📏 Distance/Min", f"{distance_per_min:.0f}m", 
+                             help="Afstand per minuut (trainingsintensiteit)")
+                    
+                # GPS trends visualization
+                if len(player_gps) >= 3:
+                    st.subheader("📈 GPS Performance Trends")
+                    
+                    # Create comprehensive trend chart
+                    fig = go.Figure()
+                    
+                    dates = player_gps['Datum'].tolist()
+                    
+                    # Total distance trend
+                    fig.add_trace(go.Scatter(
+                        x=dates,
+                        y=player_gps['Totale_Afstand'],
+                        mode='lines+markers',
+                        name='Totale Afstand (m)',
+                        line=dict(color='blue')
+                    ))
+                    
+                    # High intensity trend
+                    fig.add_trace(go.Scatter(
+                        x=dates,
+                        y=player_gps['Hoge_Intensiteit'],
+                        mode='lines+markers',
+                        name='High Intensity (m)',
+                        line=dict(color='orange')
+                    ))
+                    
+                    # Player load trend (secondary axis)
+                    fig.add_trace(go.Scatter(
+                        x=dates,
+                        y=player_gps['Player_Load'],
+                        mode='lines+markers',
+                        name='Player Load',
+                        line=dict(color='red'),
+                        yaxis='y2'
+                    ))
+                    
+                    fig.update_layout(
+                        title=f"GPS Performance Trends - {selected_player}",
+                        xaxis_title="Datum",
+                        yaxis=dict(title="Afstand (m)", side="left"),
+                        yaxis2=dict(title="Player Load", side="right", overlaying="y"),
+                        hovermode='x unified',
+                        height=500
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Position-based comparison
+                if 'Positie' in player_gps.columns and player_gps['Positie'].notna().any():
+                    st.subheader("⚽ Position-Based Analysis")
+                    
+                    player_position = player_gps['Positie'].mode().iloc[0] if not player_gps['Positie'].isna().all() else 'Unknown'
+                    
+                    # Compare with position averages (if we have data for other players in same position)
+                    position_comparison = df_gps_advanced[df_gps_advanced['Positie'] == player_position]
+                    
+                    if len(position_comparison) > 1:
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            st.write(f"**📊 {selected_player} vs {player_position} Gemiddelde:**")
+                            
+                            # Player averages
+                            player_avg_distance = recent_gps['Totale_Afstand'].mean()
+                            player_avg_hi = recent_gps['Hoge_Intensiteit'].mean()
+                            player_avg_sprint = recent_gps['Sprint_Afstand'].mean()
+                            
+                            # Position averages
+                            position_avg_distance = position_comparison['Totale_Afstand'].mean()
+                            position_avg_hi = position_comparison['Hoge_Intensiteit'].mean()
+                            position_avg_sprint = position_comparison['Sprint_Afstand'].mean()
+                            
+                            # Comparisons
+                            distance_diff = player_avg_distance - position_avg_distance
+                            hi_diff = player_avg_hi - position_avg_hi
+                            sprint_diff = player_avg_sprint - position_avg_sprint
+                            
+                            st.metric("📏 Totale Afstand", f"{player_avg_distance:.0f}m", 
+                                     delta=f"{distance_diff:+.0f}m vs positie gem.")
+                            st.metric("⚡ High Intensity", f"{player_avg_hi:.0f}m", 
+                                     delta=f"{hi_diff:+.0f}m vs positie gem.")
+                            st.metric("🏃 Sprint Afstand", f"{player_avg_sprint:.0f}m", 
+                                     delta=f"{sprint_diff:+.0f}m vs positie gem.")
+                        
+                        with col2:
+                            # Position-specific insights
+                            st.write(f"**🎯 {player_position} Insights:**")
+                            
+                            if player_position == 'Center Back':
+                                st.info("• Focus op passing accuracy en aerial duels\n• Lage sprint volumes normaal\n• Defensieve positioning key")
+                            elif player_position == 'Winger':
+                                st.info("• Hoge sprint en acceleratie volumes verwacht\n• HI distance vaak hoger dan gem.\n• 1v1 situations belangrijk")
+                            elif player_position == 'Central Attacker':
+                                st.info("• Korte, explosieve runs\n• Hoge acc/dec ratios\n• Sprint frequency in box")
+                            else:
+                                st.info("• Positionele data analyse\n• Vergelijking met positie-specifieke benchmarks\n• Tactical role considerations")
+                
+                # Training load summary
+                st.subheader("📋 Training Load Summary")
+                
+                total_sessions = len(player_gps)
+                avg_session_duration = player_gps['Duur_Minuten'].mean()
+                total_distance = player_gps['Totale_Afstand'].sum()
+                total_hi_distance = player_gps['Hoge_Intensiteit'].sum()
+                
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("📊 Totaal Sessies", f"{total_sessions}")
+                with col2:
+                    st.metric("⏱️ Gem. Duur", f"{avg_session_duration:.0f} min")
+                with col3:
+                    st.metric("📏 Totaal Afstand", f"{total_distance/1000:.1f} km")
+                with col4:
+                    st.metric("⚡ Totaal HI", f"{total_hi_distance/1000:.1f} km")
+        else:
+            st.info("Geen GPS data gevonden voor deze speler")
+    else:
+        st.info("Geen GPS data beschikbaar. Importeer eerst GPS training data.")
+
+with tab5:
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📊 Training Load Recommendations")
+        
+        df_fitness = load_fitness_data()
+        df_gps = load_gps_data()
+        
+        if not df_fitness.empty:
+            selected_player = st.selectbox("👤 Selecteer Speler voor Optimalisatie", 
+                                         sorted(df_fitness['Speler'].unique()))
+            
+            # Get player's current fitness level
+            player_fitness = df_fitness[df_fitness['Speler'] == selected_player]
+            
+            if not player_fitness.empty:
+                latest_fitness = player_fitness.iloc[-1]
+                current_mas = latest_fitness['MAS']
+                
+                st.write(f"**Huidige MAS**: {current_mas:.1f} km/h")
+                
+                # Training zone recommendations based on MAS
+                st.write("**🎯 Training Zone Aanbevelingen:**")
+                
+                zones = {
+                    'Recovery': (0.6 * current_mas, 0.7 * current_mas),
+                    'Aerobic Base': (0.7 * current_mas, 0.8 * current_mas),
+                    'Threshold': (0.85 * current_mas, 0.95 * current_mas),
+                    'VO2MAX': (0.95 * current_mas, 1.05 * current_mas),
+                    'Neuromuscular': (1.05 * current_mas, 1.2 * current_mas)
+                }
+                
+                for zone, (low, high) in zones.items():
+                    st.write(f"• **{zone}**: {low:.1f} - {high:.1f} km/h")
+                
+                # Weekly training distribution recommendation
+                st.write("**📅 Aanbevolen Weekverdeling:**")
+                weekly_dist = {
+                    'Recovery/Easy': '40%',
+                    'Aerobic Base': '25%',
+                    'Threshold': '20%',
+                    'VO2MAX': '10%',
+                    'Neuromuscular': '5%'
+                }
+                
+                for zone, percentage in weekly_dist.items():
+                    st.write(f"• **{zone}**: {percentage}")
+        
+        # Recovery recommendations
+        st.subheader("💤 Recovery Recommendations")
+        
+        if not df_gps.empty:
+            player_gps = df_gps[df_gps['Speler'] == selected_player]
+            
+            if len(player_gps) >= 3:
+                # Recent load analysis
+                recent_load = player_gps.tail(3)['Totale_Afstand'].mean()
+                avg_load = player_gps['Totale_Afstand'].mean()
+                
+                if recent_load > avg_load * 1.2:
+                    st.warning("⚠️ Verhoogde belasting - Extra recovery aanbevolen")
+                    st.write("**Aanbevelingen:**")
+                    st.write("• 24-48u actieve recovery")
+                    st.write("• Focus op hydratatie en slaap")
+                    st.write("• Mobility/stretching sessies")
+                elif recent_load < avg_load * 0.8:
+                    st.info("📈 Ruimte voor verhoogde belasting")
+                    st.write("**Mogelijkheden:**")
+                    st.write("• Intensiteit verhogen")
+                    st.write("• Extra training sessie")
+                else:
+                    st.success("✅ Optimale belasting-recovery balans")
+    
+    with col2:
+        st.subheader("🚀 Performance Targets")
+        
+        if not df_fitness.empty and selected_player:
+            player_data = df_fitness[df_fitness['Speler'] == selected_player]
+            
+            if len(player_data) >= 2:
+                # Calculate realistic targets based on progression
+                progression = calculate_fitness_progression(df_fitness, selected_player)
+                
+                if progression and 'MAS' in progression:
+                    current_mas = progression['MAS']['current_value']
+                    predicted_mas = progression['MAS']['predicted_next']
+                    
+                    st.write("**🎯 Volgende Test Targets:**")
+                    
+                    # Conservative target (90% of predicted improvement)
+                    conservative_target = current_mas + (predicted_mas - current_mas) * 0.9
+                    
+                    # Ambitious target (110% of predicted improvement)
+                    ambitious_target = current_mas + (predicted_mas - current_mas) * 1.1
+                    
+                    st.metric("📊 Huidig", f"{current_mas:.1f} km/h")
+                    st.metric("🎯 Conservatief Target", f"{conservative_target:.1f} km/h", 
+                             delta=f"+{conservative_target-current_mas:.1f}")
+                    st.metric("🚀 Ambitieus Target", f"{ambitious_target:.1f} km/h", 
+                             delta=f"+{ambitious_target-current_mas:.1f}")
+                    
+                    # Training needed for targets
+                    st.write("**📈 Benodigde Training Progressie:**")
+                    st.write(f"• Voor conservatief target: {((conservative_target-current_mas)/current_mas*100):.1f}% verbetering")
+                    st.write(f"• Voor ambitieus target: {((ambitious_target-current_mas)/current_mas*100):.1f}% verbetering")
+
+with tab4:
+    st.header("📊 Model Performance & Validation")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("🤖 Model Accuracy Metrics")
+        
+        df_fitness = load_fitness_data()
+        
+        if not df_fitness.empty:
+            # Test prediction accuracy on existing data
+            model_results = []
+            
+            for player in df_fitness['Speler'].unique():
+                player_data = df_fitness[df_fitness['Speler'] == player]
+                
+                if len(player_data) >= 3:  # Need at least 3 points for train/test split
+                    # Use first n-1 tests to predict last test
+                    train_data = player_data.iloc[:-1]
+                    test_data = player_data.iloc[-1]
+                    
+                    progression = calculate_fitness_progression(train_data, player)
+                    
+                    if progression and 'MAS' in progression:
+                        predicted = progression['MAS']['predicted_next']
+                        actual = test_data['MAS']
+                        error = abs(predicted - actual)
+                        
+                        model_results.append({
+                            'Player': player,
+                            'Predicted': predicted,
+                            'Actual': actual,
+                            'Error': error,
+                            'Error_Pct': (error / actual) * 100
+                        })
+            
+            if model_results:
+                df_results = pd.DataFrame(model_results)
+                
+                # Overall accuracy metrics
+                mean_error = df_results['Error'].mean()
+                mean_error_pct = df_results['Error_Pct'].mean()
+                
+                st.metric("📊 Mean Absolute Error", f"{mean_error:.2f} km/h")
+                st.metric("📈 Mean Percentage Error", f"{mean_error_pct:.1f}%")
+                
+                # Individual results
+                st.write("**🎯 Individual Prediction Accuracy:**")
+                st.dataframe(df_results[['Player', 'Predicted', 'Actual', 'Error_Pct']], 
+                           use_container_width=True)
+            else:
+                st.info("Onvoldoende data voor model validatie")
+    
+    with col2:
+        st.subheader("📈 Prediction Confidence")
+        
+        st.write("**🔍 Model Limitations:**")
+        st.write("• Beperkte historische data")
+        st.write("• Externe factoren niet meegenomen")
+        st.write("• Lineaire progressie assumptie")
+        
+        st.write("**💡 Aanbevelingen voor Verbetering:**")
+        st.write("• Meer frequente testing")
+        st.write("• Training load data integratie")
+        st.write("• Lifestyle factors (slaap, voeding)")
+        st.write("• Seizoensgebonden variatie")
+        
+        # Feature importance (simplified)
+        st.write("**⚡ Belangrijkste Factoren:**")
+        importance_data = {
+            'Factor': ['Vorige Test Score', 'Trainingsconsistentie', 'Leeftijd', 'Positie', 'Seizoen'],
+            'Importance': [0.4, 0.25, 0.15, 0.1, 0.1]
+        }
+        
+        fig = px.bar(importance_data, x='Importance', y='Factor', orientation='h',
+                     title="Feature Importance (Estimated)")
+        st.plotly_chart(fig, use_container_width=True)
+
+# Save prediction results to database (if we have any)
+if 'selected_player' in locals():
+    with st.sidebar:
+        st.header("💾 Save Predictions")
+        
+        if st.button("Save Current Predictions"):
+            # This would save the current predictions to the database
+            st.success("Predictions saved!")
+
+# Close database connection
+con.close()

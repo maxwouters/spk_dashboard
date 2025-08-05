@@ -1,0 +1,784 @@
+import streamlit as st
+
+# Auto-expand sidebar for better UX with sidebar controls
+st.set_page_config(page_title="SPK Dashboard", layout="wide", initial_sidebar_state="expanded")
+
+# Supabase helpers (primary)
+try:
+    from supabase_helpers import (
+        get_table_data, 
+        get_thirty_fifteen_results, 
+        get_cached_player_list,
+        test_supabase_connection,
+        safe_fetchdf,
+        check_table_exists
+    )
+    SUPABASE_MODE = True
+except ImportError:
+    # Fallback to legacy
+    from db_config import get_database_connection
+    from database_helpers import check_table_exists, get_table_columns, add_column_if_not_exists, safe_fetchdf
+    SUPABASE_MODE = False
+import pandas as pd
+from datetime import datetime, date
+import plotly.express as px
+import plotly.graph_objects as go
+from io import BytesIO
+import base64
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.backends.backend_pdf import PdfPages
+import seaborn as sns
+from datetime import timedelta
+
+
+# Database compatibility functions
+def execute_db_query(query, params=None):
+    """Execute query and return results compatible with both databases"""
+    if SUPABASE_MODE:
+        try:
+            df = safe_fetchdf(query, params or {})
+            if df.empty:
+                return []
+            # Convert DataFrame to list of tuples (like fetchall())
+            return [tuple(row) for row in df.values]
+        except Exception as e:
+            st.error(f"Query failed: {e}")
+            return []
+    else:
+        # Legacy mode
+        try:
+            if params:
+                return execute_db_query(query, params)
+            else:
+                return execute_db_query(query)
+        except Exception as e:
+            st.error(f"Legacy query failed: {e}")
+            return []
+
+def get_supabase_data(table_name, columns="*", where_conditions=None):
+    """Get data using Supabase helpers"""
+    if SUPABASE_MODE:
+        return get_table_data(table_name, columns, where_conditions)
+    else:
+        # Legacy fallback
+        query = f"SELECT {columns} FROM {table_name}"
+        if where_conditions:
+            conditions = [f"{k} = '{v}'" for k, v in where_conditions.items()]
+            query += f" WHERE {' AND '.join(conditions)}"
+        return safe_fetchdf(query)
+
+# Page config already set at top of file
+
+st.subheader("📈 Speler Progressie & Doelen")
+
+# Database setup
+if SUPABASE_MODE:
+    st.info("🌐 Using Supabase database")
+    if not test_supabase_connection():
+        st.error("❌ Cannot connect to Supabase")
+        st.stop()
+    con = None  # Will use Supabase helpers
+else:
+    # Legacy mode
+    # Legacy mode fallback
+    try:
+        con = get_database_connection()
+    except NameError:
+        st.error("❌ Database connection not available")
+        st.stop()
+# Database tabellen maken
+execute_db_query("""
+    CREATE TABLE IF NOT EXISTS speler_doelen (
+        doel_id INTEGER PRIMARY KEY,
+        speler TEXT,
+        doeltype TEXT,
+        titel TEXT,
+        beschrijving TEXT,
+        target_datum DATE,
+        status TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+execute_db_query("""
+    CREATE TABLE IF NOT EXISTS doel_progressie (
+        progressie_id INTEGER PRIMARY KEY,
+        doel_id INTEGER,
+        datum DATE,
+        score INTEGER,
+        notities TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (doel_id) REFERENCES speler_doelen(doel_id)
+    )
+""")
+
+execute_db_query("""
+    CREATE TABLE IF NOT EXISTS gesprek_notities (
+        notitie_id INTEGER PRIMARY KEY,
+        speler TEXT,
+        datum DATE,
+        onderwerp TEXT,
+        notities TEXT,
+        coach TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+# Voeg coach kolom toe als deze nog niet bestaat
+try:
+    execute_db_query("ALTER TABLE gesprek_notities ADD COLUMN coach TEXT")
+except:
+    pass  # Kolom bestaat al
+
+# Sequences maken
+try:
+    execute_db_query("CREATE SEQUENCE IF NOT EXISTS doel_id_seq START 1")
+    execute_db_query("CREATE SEQUENCE IF NOT EXISTS progressie_id_seq START 1")
+    execute_db_query("CREATE SEQUENCE IF NOT EXISTS notitie_id_seq START 1")
+except:
+    pass
+
+# Haal alle spelers op
+if SUPABASE_MODE:
+    try:
+        # Use get_cached_player_list from supabase_helpers (most reliable)
+        from supabase_helpers import get_cached_player_list
+        spelers_list = get_cached_player_list()
+        
+        # Convert to query result format (list of tuples)
+        spelers_query = [(speler,) for speler in spelers_list if speler is not None and str(speler).strip()]
+    except Exception as e:
+        st.error(f"Error loading players: {e}")
+        spelers_query = []
+else:
+    # Legacy mode
+    spelers_query = execute_db_query("""
+        SELECT DISTINCT naam FROM spelers_profiel
+        UNION
+        SELECT DISTINCT Speler as naam FROM thirty_fifteen_results 
+        ORDER BY naam
+    """)
+
+if spelers_query:
+    alle_spelers = [s[0] for s in spelers_query]
+    
+    # Haal alle coaches op
+    try:
+        coaches_query = execute_db_query("""
+            SELECT DISTINCT naam
+            FROM contact_lijst 
+            WHERE actief = true
+            ORDER BY naam
+        """)
+        alle_coaches = [c[0] for c in coaches_query] if coaches_query else ["Maxim Wouters"]
+    except:
+        alle_coaches = ["Maxim Wouters"]    # Sidebar voor speler selectie
+    geselecteerde_speler = st.sidebar.selectbox("👤 Selecteer Speler", alle_spelers)
+    
+    # Tabs voor verschillende secties
+    tab1, tab2, tab3, tab4 = st.tabs(["🎯 Doelen", "📊 Voortgang", "💬 Gesprekken", "📄 Export"])
+    
+    with tab1:
+        st.markdown("### 🎯 Doelen Beheer")
+        
+        # Nieuw doel toevoegen
+        with st.expander("➕ Nieuw Doel Toevoegen"):
+            with st.form("nieuw_doel"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    doeltype = st.selectbox("🏷️ Type", ["Technisch", "Tactisch", "Mentaal", "Fysiek", "Algemeen"])
+                    titel = st.text_input("📝 Titel", placeholder="Bijv. Verbeteren van eerste touch")
+                with col2:
+                    target_datum = st.date_input("🎯 Doel Datum", value=datetime.today().date())
+                    status = st.selectbox("📊 Status", ["Actief", "Behaald", "Uitgesteld", "Geannuleerd"])
+                
+                beschrijving = st.text_area("📋 Beschrijving", placeholder="Uitgebreide beschrijving van het doel...")
+                
+                submitted = st.form_submit_button("✅ Doel Toevoegen")
+                
+                if submitted and titel:
+                    execute_db_query("""
+                        INSERT INTO speler_doelen (doel_id, speler, doeltype, titel, beschrijving, target_datum, status)
+                        VALUES (nextval('doel_id_seq'), ?, ?, ?, ?, ?, ?)
+                    """, (geselecteerde_speler, doeltype, titel, beschrijving, target_datum, status))
+                    
+                    st.success(f"✅ Doel '{titel}' toegevoegd voor {geselecteerde_speler}!")
+                    st.rerun()
+        
+        # Bestaande doelen tonen
+        doelen = execute_db_query("""
+            SELECT doel_id, doeltype, titel, beschrijving, target_datum, status, created_at
+            FROM speler_doelen 
+            WHERE speler = ?
+            ORDER BY created_at DESC
+        """, (geselecteerde_speler,))
+        
+        if doelen:
+            st.markdown("### 📋 Huidige Doelen")
+            
+            for doel in doelen:
+                doel_id, doeltype, titel, beschrijving, target_datum, status, created_at = doel
+                
+                # Status kleur
+                status_color = {
+                    "Actief": "🟢",
+                    "Behaald": "✅", 
+                    "Uitgesteld": "🟡",
+                    "Geannuleerd": "🔴"
+                }
+                
+                with st.expander(f"{status_color.get(status, '⚪')} [{doeltype}] {titel} - {status}"):
+                    col1, col2 = st.columns([2, 1])
+                    
+                    with col1:
+                        st.write(f"**Beschrijving:** {beschrijving}")
+                        st.write(f"**Doel Datum:** {pd.to_datetime(target_datum).date().strftime('%d/%m/%Y')}")
+                        st.write(f"**Aangemaakt:** {pd.to_datetime(created_at).date().strftime('%d/%m/%Y')}")
+                        
+                        # Status wijzigen
+                        nieuwe_status = st.selectbox("Status wijzigen", 
+                                                   ["Actief", "Behaald", "Uitgesteld", "Geannuleerd"],
+                                                   index=["Actief", "Behaald", "Uitgesteld", "Geannuleerd"].index(status),
+                                                   key=f"status_{doel_id}")
+                        
+                        if nieuwe_status != status:
+                            if st.button("💾 Status Bijwerken", key=f"update_{doel_id}"):
+                                execute_db_query("UPDATE speler_doelen SET status = ? WHERE doel_id = ?", (nieuwe_status, doel_id))
+                                st.success("Status bijgewerkt!")
+                                st.rerun()
+                    
+                    with col2:
+                        if st.button("🗑️ Verwijderen", key=f"delete_{doel_id}"):
+                            execute_db_query("DELETE FROM doel_progressie WHERE doel_id = ?", (doel_id,))
+                            execute_db_query("DELETE FROM speler_doelen WHERE doel_id = ?", (doel_id,))
+                            st.success("Doel verwijderd!")
+                            st.rerun()
+        else:
+            st.info(f"📭 Nog geen doelen ingesteld voor {geselecteerde_speler}")
+    
+    with tab2:
+        st.markdown("### 📊 Voortgang Tracker")
+        
+        # Selecteer doel voor voortgang
+        actieve_doelen = execute_db_query("""
+            SELECT doel_id, titel, doeltype
+            FROM speler_doelen 
+            WHERE speler = ? AND status = 'Actief'
+            ORDER BY titel
+        """, (geselecteerde_speler,))
+        
+        if actieve_doelen:
+            doel_opties = {f"{titel} ({doeltype})": doel_id for doel_id, titel, doeltype in actieve_doelen}
+            
+            if doel_opties:
+                geselecteerd_doel_display = st.selectbox("🎯 Selecteer Doel", list(doel_opties.keys()))
+                geselecteerd_doel_id = doel_opties[geselecteerd_doel_display]
+                
+                # Voortgang toevoegen
+                with st.expander("➕ Voortgang Toevoegen"):
+                    with st.form("nieuwe_voortgang"):
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            progressie_datum = st.date_input("📅 Datum", value=datetime.today().date())
+                            score = st.slider("📈 Score (1-10)", min_value=1, max_value=10, value=5, 
+                                            help="1 = Zeer slecht, 10 = Uitstekend")
+                        with col2:
+                            notities = st.text_area("📝 Notities", placeholder="Wat ging goed/slecht? Observaties...")
+                        
+                        submitted = st.form_submit_button("✅ Voortgang Toevoegen")
+                        
+                        if submitted:
+                            execute_db_query("""
+                                INSERT INTO doel_progressie (progressie_id, doel_id, datum, score, notities)
+                                VALUES (nextval('progressie_id_seq'), ?, ?, ?, ?)
+                            """, (geselecteerd_doel_id, progressie_datum, score, notities))
+                            
+                            st.success("✅ Voortgang toegevoegd!")
+                            st.rerun()
+                
+                # Voortgang visualisatie
+                progressie_data = execute_db_query("""
+                    SELECT datum, score, notities
+                    FROM doel_progressie 
+                    WHERE doel_id = ?
+                    ORDER BY datum
+                """, (geselecteerd_doel_id,))
+                
+                if progressie_data:
+                    st.markdown("### 📈 Voortgang Grafiek")
+                    
+                    df_progressie = pd.DataFrame(progressie_data, columns=['Datum', 'Score', 'Notities'])
+                    df_progressie['Datum'] = pd.to_datetime(df_progressie['Datum'])
+                    
+                    fig = px.line(df_progressie, x='Datum', y='Score', 
+                                title=f"Voortgang: {geselecteerd_doel_display}",
+                                markers=True)
+                    fig.update_layout(yaxis_range=[0, 10])
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Voortgang tabel
+                    st.markdown("### 📋 Voortgang Details")
+                    for datum, score, notities in progressie_data:
+                        datum_str = pd.to_datetime(datum).date().strftime('%d/%m/%Y')
+                        
+                        with st.expander(f"{datum_str} - Score: {score}/10"):
+                            st.write(f"**Notities:** {notities if notities else 'Geen notities'}")
+                else:
+                    st.info("📭 Nog geen voortgang geregistreerd voor dit doel")
+        else:
+            st.info(f"📭 Geen actieve doelen voor {geselecteerde_speler}")
+    
+    with tab3:
+        st.markdown("### 💬 1-op-1 Gesprekken")
+        
+        # Nieuw gesprek toevoegen
+        with st.expander("➕ Nieuw Gesprek Toevoegen"):
+            with st.form("nieuw_gesprek"):
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    gesprek_datum = st.date_input("📅 Datum Gesprek", value=datetime.today().date())
+                with col2:
+                    onderwerp = st.text_input("🏷️ Onderwerp", placeholder="Bijv. Maandelijkse evaluatie")
+                with col3:
+                    geselecteerde_coach = st.selectbox("👨‍💼 Coach", alle_coaches, index=0)
+                
+                notities = st.text_area("📝 Gespreknotities", 
+                                      placeholder="• Wat besproken?\n• Feedback van speler\n• Afspraken gemaakt\n• Volgende stappen",
+                                      height=150)
+                
+                submitted = st.form_submit_button("✅ Gesprek Opslaan")
+                
+                if submitted and onderwerp:
+                    execute_db_query("""
+                        INSERT INTO gesprek_notities (notitie_id, speler, datum, onderwerp, notities, coach)
+                        VALUES (nextval('notitie_id_seq'), ?, ?, ?, ?, ?)
+                    """, (geselecteerde_speler, gesprek_datum, onderwerp, notities, geselecteerde_coach))
+                    
+                    st.success(f"✅ Gesprek '{onderwerp}' opgeslagen!")
+                    st.rerun()
+        
+        # Gesprekken overzicht
+        gesprekken = execute_db_query("""
+            SELECT notitie_id, datum, onderwerp, notities, coach, created_at
+            FROM gesprek_notities 
+            WHERE speler = ?
+            ORDER BY datum DESC
+        """, (geselecteerde_speler,))
+        
+        if gesprekken:
+            st.markdown("### 📋 Gesprekgeschiedenis")
+            
+            for gesprek in gesprekken:
+                notitie_id, datum, onderwerp, notities, coach, created_at = gesprek
+                datum_str = pd.to_datetime(datum).date().strftime('%d/%m/%Y')
+                
+                with st.expander(f"💬 {onderwerp} - {datum_str}"):
+                    st.write(f"**Datum:** {datum_str}")
+                    st.write(f"**Coach:** {coach if coach else 'Onbekend'}")
+                    st.write(f"**Notities:**")
+                    st.write(notities if notities else 'Geen notities')
+                    
+                    if st.button("🗑️ Verwijderen", key=f"del_gesprek_{notitie_id}"):
+                        execute_db_query("DELETE FROM gesprek_notities WHERE notitie_id = ?", (notitie_id,))
+                        st.success("Gesprek verwijderd!")
+                        st.rerun()
+        else:
+            st.info(f"📭 Nog geen gesprekken geregistreerd voor {geselecteerde_speler}")
+    
+    with tab4:
+        st.markdown("### 📄 Progressie Export")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            export_periode = st.selectbox("📅 Periode", 
+                                        ["Laatste maand", "Laatste 3 maanden", "Laatste 6 maanden", "Alles"])
+        
+        with col2:
+            export_type = st.selectbox("📋 Export Type", 
+                                     ["Volledig Rapport", "Alleen Doelen", "Alleen Gesprekken"])
+        
+        if st.button("📊 Genereer Export", type="primary"):
+            # Bepaal datumfilter
+            today = datetime.today().date()
+            if export_periode == "Laatste maand":
+                filter_datum = today - timedelta(days=30)
+            elif export_periode == "Laatste 3 maanden":
+                filter_datum = today - timedelta(days=90)
+            elif export_periode == "Laatste 6 maanden":
+                filter_datum = today - timedelta(days=180)
+            else:
+                filter_datum = date(2000, 1, 1)
+            
+            # Genereer PDF rapport
+            def create_pdf_report():
+                buffer = BytesIO()
+                
+                with PdfPages(buffer) as pdf:
+                    # Set up matplotlib style
+                    plt.style.use('seaborn-v0_8-whitegrid')
+                    plt.rcParams.update({
+                        'font.size': 10,
+                        'axes.titlesize': 12,
+                        'axes.labelsize': 10,
+                        'xtick.labelsize': 9,
+                        'ytick.labelsize': 9,
+                        'legend.fontsize': 9,
+                        'figure.titlesize': 16
+                    })
+                    
+                    # Pagina 1: Overzicht en Samenvatting
+                    fig = plt.figure(figsize=(11.7, 8.3))
+                    fig.patch.set_facecolor('white')
+                    
+                    # Header sectie
+                    header_ax = plt.subplot2grid((4, 4), (0, 0), colspan=4, rowspan=1)
+                    header_ax.text(0.5, 0.7, f'PROGRESSIE RAPPORT', 
+                                  ha='center', va='center', fontsize=20, fontweight='bold', 
+                                  color='#2E86AB', transform=header_ax.transAxes)
+                    header_ax.text(0.5, 0.3, f'{geselecteerde_speler}', 
+                                  ha='center', va='center', fontsize=16, fontweight='bold',
+                                  color='#A23B72', transform=header_ax.transAxes)
+                    header_ax.text(0.5, 0.05, f'Periode: {export_periode} | Gegenereerd: {today.strftime("%d/%m/%Y")}', 
+                                  ha='center', va='center', fontsize=10, style='italic',
+                                  color='#666666', transform=header_ax.transAxes)
+                    header_ax.axis('off')
+                    
+                    # Hoofdgrafieken
+                    ax1 = plt.subplot2grid((4, 4), (1, 0), colspan=2, rowspan=1)  # Algemene voortgang
+                    ax2 = plt.subplot2grid((4, 4), (1, 2), colspan=2, rowspan=1)  # Gemiddelde per type
+                    ax3 = plt.subplot2grid((4, 4), (2, 0), colspan=2, rowspan=1)  # Score verdeling
+                    ax4 = plt.subplot2grid((4, 4), (2, 2), colspan=2, rowspan=1)  # Status verdeling
+                    
+                    # Algemene statistieken berekenen
+                    alle_scores = execute_db_query("""
+                        SELECT dp.datum, dp.score, sd.doeltype
+                        FROM doel_progressie dp
+                        JOIN speler_doelen sd ON dp.doel_id = sd.doel_id
+                        WHERE sd.speler = ? AND dp.datum >= ?
+                        ORDER BY dp.datum
+                    """, (geselecteerde_speler, filter_datum))
+                    
+                    if alle_scores:
+                        df_scores = pd.DataFrame(alle_scores, columns=['Datum', 'Score', 'Doeltype'])
+                        df_scores['Datum'] = pd.to_datetime(df_scores['Datum'])
+                        
+                        # 1. Algemene voortgang over tijd
+                        ax1.plot(df_scores['Datum'], df_scores['Score'], marker='o', linewidth=3, 
+                               markersize=6, color='#2E86AB', markerfacecolor='#F18F01', 
+                               markeredgecolor='#2E86AB', markeredgewidth=2)
+                        ax1.set_title('📈 Algemene Voortgang Over Tijd', fontweight='bold', color='#2E86AB')
+                        ax1.set_ylabel('Score (1-10)', fontweight='bold')
+                        ax1.set_ylim(0, 10.5)
+                        ax1.grid(True, alpha=0.3, linestyle='--')
+                        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m'))
+                        ax1.xaxis.set_major_locator(mdates.WeekdayLocator())
+                        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
+                        
+                        # Trend lijn toevoegen
+                        if len(df_scores) > 1:
+                            z = np.polyfit(mdates.date2num(df_scores['Datum']), df_scores['Score'], 1)
+                            p = np.poly1d(z)
+                            trend_color = '#C73E1D' if z[0] < 0 else '#038A3E'
+                            ax1.plot(df_scores['Datum'], p(mdates.date2num(df_scores['Datum'])), 
+                                   "--", alpha=0.8, color=trend_color, linewidth=2, label='Trendlijn')
+                            ax1.legend(frameon=True, fancybox=True, shadow=True)
+                        
+                        # Achtergrond kleur zones
+                        ax1.axhspan(8, 10, alpha=0.1, color='green', label='Uitstekend')
+                        ax1.axhspan(6, 8, alpha=0.1, color='orange', label='Goed') 
+                        ax1.axhspan(0, 6, alpha=0.1, color='red', label='Verbetering nodig')
+                        
+                        # 2. Gemiddelde scores per doeltype
+                        gemiddelde_per_type = df_scores.groupby('Doeltype')['Score'].mean()
+                        type_colors = {'Technisch': '#2E86AB', 'Tactisch': '#A23B72', 'Mentaal': '#F18F01', 
+                                     'Fysiek': '#C73E1D', 'Algemeen': '#038A3E'}
+                        bar_colors = [type_colors.get(t, '#7F8C8D') for t in gemiddelde_per_type.index]
+                        
+                        bars = ax2.bar(gemiddelde_per_type.index, gemiddelde_per_type.values, 
+                                     color=bar_colors, alpha=0.8, edgecolor='white', linewidth=2)
+                        ax2.set_title('📊 Gemiddelde Score per Doeltype', fontweight='bold', color='#2E86AB')
+                        ax2.set_ylabel('Gemiddelde Score', fontweight='bold')
+                        ax2.set_ylim(0, 10.5)
+                        plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
+                        
+                        # Waarden op balken tonen met styling
+                        for bar, val in zip(bars, gemiddelde_per_type.values):
+                            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.15, 
+                                   f'{val:.1f}', ha='center', va='bottom', fontweight='bold', fontsize=11)
+                        
+                        # Referentielijn voor gemiddelde
+                        overall_avg = df_scores['Score'].mean()
+                        ax2.axhline(y=overall_avg, color='red', linestyle=':', alpha=0.7, 
+                                  label=f'Totaal gemiddelde: {overall_avg:.1f}')
+                        ax2.legend()
+                        
+                        # 3. Voortgang verdeling (histogram)
+                        n, bins, patches = ax3.hist(df_scores['Score'], bins=8, edgecolor='white', 
+                                                   alpha=0.8, linewidth=2)
+                        
+                        # Kleur de balken op basis van score
+                        for i, p in enumerate(patches):
+                            if bins[i] < 5:
+                                p.set_facecolor('#C73E1D')  # Rood voor lage scores
+                            elif bins[i] < 7:
+                                p.set_facecolor('#F18F01')  # Oranje voor gemiddelde scores
+                            else:
+                                p.set_facecolor('#038A3E')  # Groen voor hoge scores
+                        
+                        ax3.set_title('📈 Verdeling van Scores', fontweight='bold', color='#2E86AB')
+                        ax3.set_xlabel('Score', fontweight='bold')
+                        ax3.set_ylabel('Aantal metingen', fontweight='bold')
+                        ax3.set_xlim(0, 10)
+                        
+                        # 4. Aantal doelen per status
+                        doelen_status = execute_db_query("""
+                            SELECT status, COUNT(*) as aantal
+                            FROM speler_doelen 
+                            WHERE speler = ? AND created_at >= ?
+                            GROUP BY status
+                        """, (geselecteerde_speler, filter_datum))
+                        
+                        if doelen_status:
+                            df_status = pd.DataFrame(doelen_status, columns=['Status', 'Aantal'])
+                            colors_status = {'Actief': '#2E86AB', 'Behaald': '#038A3E', 
+                                           'Uitgesteld': '#F18F01', 'Geannuleerd': '#C73E1D'}
+                            pie_colors = [colors_status.get(status, '#7F8C8D') for status in df_status['Status']]
+                            
+                            wedges, texts, autotexts = ax4.pie(df_status['Aantal'], labels=df_status['Status'], 
+                                                             autopct='%1.0f%%', colors=pie_colors,
+                                                             startangle=90, textprops={'fontweight': 'bold'})
+                            ax4.set_title('🎯 Doelen Status Verdeling', fontweight='bold', color='#2E86AB')
+                            
+                            # Mooiere styling voor pie chart
+                            for autotext in autotexts:
+                                autotext.set_color('white')
+                                autotext.set_fontweight('bold')
+                                autotext.set_fontsize(10)
+                        
+                        # Statistieken panel onderaan
+                        stats_ax = plt.subplot2grid((4, 4), (3, 0), colspan=4, rowspan=1)
+                        stats_ax.axis('off')
+                        
+                        totaal_metingen = len(df_scores)
+                        gemiddelde_score = df_scores['Score'].mean()
+                        laatste_score = df_scores['Score'].iloc[-1] if len(df_scores) > 0 else 0
+                        eerste_score = df_scores['Score'].iloc[0] if len(df_scores) > 0 else 0
+                        verbetering = laatste_score - eerste_score
+                        
+                        # Maak 5 statistiek boxes
+                        stat_boxes = [
+                            (f"{totaal_metingen}", "Totaal\nMetingen", "#2E86AB"),
+                            (f"{gemiddelde_score:.1f}/10", "Gemiddelde\nScore", "#A23B72"),
+                            (f"{laatste_score}/10", "Laatste\nScore", "#F18F01"),
+                            (f"{eerste_score}/10", "Eerste\nScore", "#038A3E"),
+                            (f"{verbetering:+.1f}", "Verbetering\n(punten)", "#C73E1D" if verbetering < 0 else "#038A3E")
+                        ]
+                        
+                        for i, (value, label, color) in enumerate(stat_boxes):
+                            x_pos = 0.1 + i * 0.18
+                            
+                            # Box achtergrond
+                            stats_ax.add_patch(plt.Rectangle((x_pos-0.08, 0.2), 0.16, 0.6, 
+                                                           facecolor=color, alpha=0.1, 
+                                                           edgecolor=color, linewidth=2))
+                            
+                            # Grote waarde
+                            stats_ax.text(x_pos, 0.65, value, ha='center', va='center', 
+                                        fontsize=16, fontweight='bold', color=color)
+                            
+                            # Label
+                            stats_ax.text(x_pos, 0.35, label, ha='center', va='center', 
+                                        fontsize=10, fontweight='bold', color='#333333')
+                        
+                        # Titel voor statistieken
+                        stats_ax.text(0.5, 0.9, 'SAMENVATTING STATISTIEKEN', ha='center', va='center',
+                                    fontsize=14, fontweight='bold', color='#2E86AB',
+                                    transform=stats_ax.transAxes)
+                    else:
+                        # Geen data beschikbaar
+                        for ax in [ax1, ax2, ax3, ax4]:
+                            ax.text(0.5, 0.5, 'Geen data beschikbaar', ha='center', va='center', 
+                                  transform=ax.transAxes, fontsize=12)
+                            ax.set_title('Geen Data')
+                    
+                    plt.tight_layout()
+                    pdf.savefig(fig, bbox_inches='tight')
+                    plt.close()
+                    
+                    # Pagina 2: Gedetailleerde doelen
+                    if export_type in ["Volledig Rapport", "Alleen Doelen"]:
+                        doelen_export = execute_db_query("""
+                            SELECT doel_id, doeltype, titel, beschrijving, target_datum, status, created_at
+                            FROM speler_doelen 
+                            WHERE speler = ? AND created_at >= ?
+                            ORDER BY created_at DESC
+                        """, (geselecteerde_speler, filter_datum))
+                        
+                        if doelen_export:
+                            fig, axes = plt.subplots(len(doelen_export), 1, figsize=(11.7, max(8.3, len(doelen_export)*2)))
+                            if len(doelen_export) == 1:
+                                axes = [axes]
+                            
+                            fig.suptitle('DOELEN DETAIL OVERZICHT', fontsize=16, fontweight='bold')
+                            
+                            for idx, doel in enumerate(doelen_export):
+                                doel_id, doeltype, titel, beschrijving, target_datum, status, created_at = doel
+                                ax = axes[idx]
+                                
+                                # Voortgang voor dit doel
+                                progressie_doel = execute_db_query("""
+                                    SELECT datum, score, notities
+                                    FROM doel_progressie 
+                                    WHERE doel_id = ?
+                                    ORDER BY datum
+                                """, (doel_id,))
+                                
+                                if progressie_doel:
+                                    df_prog = pd.DataFrame(progressie_doel, columns=['Datum', 'Score', 'Notities'])
+                                    df_prog['Datum'] = pd.to_datetime(df_prog['Datum'])
+                                    
+                                    ax.plot(df_prog['Datum'], df_prog['Score'], marker='o', linewidth=2, 
+                                           markersize=6, label=f'{titel}')
+                                    ax.set_ylim(0, 10)
+                                    ax.grid(True, alpha=0.3)
+                                    ax.set_ylabel('Score')
+                                    
+                                    # Trend lijn
+                                    if len(df_prog) > 1:
+                                        z = np.polyfit(mdates.date2num(df_prog['Datum']), df_prog['Score'], 1)
+                                        p = np.poly1d(z)
+                                        ax.plot(df_prog['Datum'], p(mdates.date2num(df_prog['Datum'])), 
+                                               "--", alpha=0.8, color='red')
+                                    
+                                    # Gemiddelde lijn
+                                    gem_score = df_prog['Score'].mean()
+                                    ax.axhline(y=gem_score, color='green', linestyle=':', alpha=0.7, 
+                                              label=f'Gemiddelde: {gem_score:.1f}')
+                                else:
+                                    ax.text(0.5, 0.5, 'Nog geen voortgang data', ha='center', va='center', 
+                                           transform=ax.transAxes)
+                                
+                                # Titel en info
+                                title_text = f'[{doeltype}] {titel} - Status: {status}'
+                                ax.set_title(title_text, fontweight='bold', fontsize=10)
+                                ax.legend()
+                                
+                                # Beschrijving als tekst onder grafiek
+                                if beschrijving:
+                                    ax.text(0.02, -0.15, f'Beschrijving: {beschrijving}', 
+                                           transform=ax.transAxes, fontsize=8, wrap=True)
+                            
+                            plt.tight_layout()
+                            pdf.savefig(fig, bbox_inches='tight')
+                            plt.close()
+                    
+                    # Pagina 3: Gesprekken (indien geselecteerd)
+                    if export_type in ["Volledig Rapport", "Alleen Gesprekken"]:
+                        gesprekken_export = execute_db_query("""
+                            SELECT datum, onderwerp, notities
+                            FROM gesprek_notities 
+                            WHERE speler = ? AND datum >= ?
+                            ORDER BY datum DESC
+                        """, (geselecteerde_speler, filter_datum))
+                        
+                        if gesprekken_export:
+                            fig, ax = plt.subplots(figsize=(11.7, 8.3))
+                            fig.suptitle('GESPREKKEN OVERZICHT', fontsize=16, fontweight='bold')
+                            
+                            # Maak een tekstpagina voor gesprekken
+                            y_pos = 0.95
+                            for gesprek in gesprekken_export:
+                                datum, onderwerp, notities = gesprek
+                                datum_str = pd.to_datetime(datum).date().strftime('%d/%m/%Y')
+                                
+                                # Onderwerp en datum
+                                ax.text(0.05, y_pos, f'{onderwerp} - {datum_str}', 
+                                       transform=ax.transAxes, fontsize=12, fontweight='bold')
+                                y_pos -= 0.05
+                                
+                                # Notities (word wrap)
+                                if notities:
+                                    wrapped_notes = []
+                                    words = notities.split()
+                                    line = ""
+                                    for word in words:
+                                        if len(line + word) < 80:
+                                            line += word + " "
+                                        else:
+                                            wrapped_notes.append(line.strip())
+                                            line = word + " "
+                                    if line:
+                                        wrapped_notes.append(line.strip())
+                                    
+                                    for note_line in wrapped_notes:
+                                        ax.text(0.05, y_pos, note_line, transform=ax.transAxes, fontsize=10)
+                                        y_pos -= 0.03
+                                
+                                y_pos -= 0.05  # Extra ruimte tussen gesprekken
+                                
+                                if y_pos < 0.1:  # Nieuwe pagina als nodig
+                                    break
+                            
+                            ax.set_xlim(0, 1)
+                            ax.set_ylim(0, 1)
+                            ax.axis('off')
+                            
+                            pdf.savefig(fig, bbox_inches='tight')
+                            plt.close()
+                
+                buffer.seek(0)
+                return buffer.getvalue()
+            
+            # Genereer PDF
+            try:
+                import numpy as np  # Nodig voor polyfit
+                pdf_data = create_pdf_report()
+                
+                # Download knop
+                st.markdown("### 📥 Download")
+                st.download_button(
+                    label="📄 Download PDF Rapport",
+                    data=pdf_data,
+                    file_name=f"progressie_rapport_{geselecteerde_speler}_{today.strftime('%Y%m%d')}.pdf",
+                    mime="application/pdf"
+                )
+                
+                st.success("✅ PDF rapport succesvol gegenereerd!")
+                
+                # Toon statistieken preview
+                alle_scores = execute_db_query("""
+                    SELECT dp.datum, dp.score, sd.doeltype
+                    FROM doel_progressie dp
+                    JOIN speler_doelen sd ON dp.doel_id = sd.doel_id
+                    WHERE sd.speler = ? AND dp.datum >= ?
+                    ORDER BY dp.datum
+                """, (geselecteerde_speler, filter_datum))
+                
+                if alle_scores:
+                    df_scores = pd.DataFrame(alle_scores, columns=['Datum', 'Score', 'Doeltype'])
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Totaal Metingen", len(df_scores))
+                    with col2:
+                        st.metric("Gemiddelde Score", f"{df_scores['Score'].mean():.1f}/10")
+                    with col3:
+                        laatste_score = df_scores['Score'].iloc[-1] if len(df_scores) > 0 else 0
+                        st.metric("Laatste Score", f"{laatste_score}/10")
+                    with col4:
+                        eerste_score = df_scores['Score'].iloc[0] if len(df_scores) > 0 else 0
+                        verbetering = laatste_score - eerste_score
+                        st.metric("Verbetering", f"{verbetering:+.1f}", delta=f"{verbetering:+.1f}")
+                
+            except Exception as e:
+                st.error(f"❌ Fout bij genereren PDF: {str(e)}")
+                st.info("💡 Zorg ervoor dat er voldoende data beschikbaar is voor het rapport.")
+
+else:
+    st.warning("⚠️ Geen spelers gevonden in database. Voeg eerst testresultaten toe.")
+
+# Safe database connection cleanup
+
+# Database cleanup handled by Supabase helpers

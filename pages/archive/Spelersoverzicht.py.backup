@@ -1,0 +1,541 @@
+import streamlit as st
+import pandas as pd
+import duckdb
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import datetime, timedelta
+import plotly.express as px
+
+from db_config import get_database_connection
+from database_helpers import check_table_exists, get_table_columns, add_column_if_not_exists, safe_fetchdf
+st.set_page_config(page_title="Spelersoverzicht - SPK Dashboard", layout="wide")
+
+# Custom CSS styling consistent with home page
+st.markdown("""
+<style>
+    .main-header {
+        background: linear-gradient(90deg, #2E86AB 0%, #A23B72 100%);
+        padding: 1rem;
+        border-radius: 10px;
+        margin-bottom: 2rem;
+        color: white;
+        text-align: center;
+    }
+    
+    .info-card {
+        background: linear-gradient(135deg, #FAFCFF 0%, #E8F4FD 100%);
+        padding: 1.5rem;
+        border-radius: 10px;
+        border-left: 4px solid #2E86AB;
+        margin: 1rem 0;
+        box-shadow: 0 2px 4px rgba(46, 134, 171, 0.1);
+    }
+    
+    .section-card {
+        background: white;
+        padding: 1.2rem;
+        border-radius: 8px;
+        border: 1px solid #E8F4FD;
+        margin: 0.8rem 0;
+        box-shadow: 0 2px 4px rgba(46, 134, 171, 0.05);
+    }
+    
+    .accent-blue { color: #2E86AB; font-weight: bold; }
+    .accent-purple { color: #A23B72; font-weight: bold; }
+    .accent-orange { color: #F18F01; font-weight: bold; }
+    .accent-green { color: #2E8B57; font-weight: bold; }
+    
+    .metric-box {
+        background: linear-gradient(135deg, #F0F8FF 0%, #E8F4FD 100%);
+        padding: 1rem;
+        border-radius: 8px;
+        text-align: center;
+        margin: 0.5rem 0;
+        border: 1px solid #E8F4FD;
+    }
+    
+    .goal-item {
+        background: #F8FFFA;
+        border-left: 4px solid #2E8B57;
+        padding: 0.8rem;
+        margin: 0.5rem 0;
+        border-radius: 0 8px 8px 0;
+    }
+    
+    .conversation-item {
+        background: #FFF8F0;
+        border-left: 4px solid #F18F01;
+        padding: 0.8rem;
+        margin: 0.5rem 0;
+        border-radius: 0 8px 8px 0;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="main-header"><h1>👤 Spelersoverzicht</h1></div>', unsafe_allow_html=True)
+
+# Database connectie
+con = get_database_connection()
+
+# Zorg ervoor dat de benodigde tabellen bestaan
+con.execute("""
+    CREATE TABLE IF NOT EXISTS speler_doelen (
+        doel_id INTEGER PRIMARY KEY,
+        speler TEXT,
+        doeltype TEXT,
+        titel TEXT,
+        beschrijving TEXT,
+        target_datum DATE,
+        status TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+con.execute("""
+    CREATE TABLE IF NOT EXISTS gesprek_notities (
+        notitie_id INTEGER PRIMARY KEY,
+        speler TEXT,
+        datum DATE,
+        onderwerp TEXT,
+        notities TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+# Sequences maken indien nodig
+try:
+    con.execute("CREATE SEQUENCE IF NOT EXISTS doel_id_seq START 1")
+    con.execute("CREATE SEQUENCE IF NOT EXISTS notitie_id_seq START 1")
+except:
+    pass
+
+# Check database migratie voor MAS kolom
+try:
+    existing_columns = get_table_columns(con, "thirty_fifteen_results")
+    
+    if add_column_if_not_exists(con, "thirty_fifteen_results", "MAS", "MAS DOUBLE"):)
+        con.execute("UPDATE thirty_fifteen_results SET MAS = TrueVIFT * 0.95 WHERE MAS IS NULL")
+except:
+    pass
+
+# Check of er data is
+table_exists = check_table_exists(con, "thirty_fifteen_results")
+
+if not table_exists:
+    st.warning("📭 Er zijn nog geen testresultaten beschikbaar.")
+else:
+    # Haal alle data op
+    all_data = safe_fetchdf(con, "SELECT * FROM thirty_fifteen_results ORDER BY Maand DESC, Speler")
+    
+    # Check en bereken MAS als deze niet bestaat
+    if 'MAS' not in all_data.columns:
+        all_data['MAS'] = all_data['TrueVIFT'] * 0.95
+    
+    if len(all_data) == 0:
+        st.warning("📭 Er zijn nog geen testresultaten beschikbaar.")
+    else:
+        # Speler selectie
+        spelers = sorted(all_data["Speler"].unique())
+        selected_speler = st.selectbox("👤 Selecteer speler", spelers)
+        
+        # Filter data voor geselecteerde speler
+        speler_data = all_data[all_data["Speler"] == selected_speler].sort_values("Maand")
+        
+        if len(speler_data) == 0:
+            st.warning(f"Geen data gevonden voor {selected_speler}")
+        else:
+            # Hoofdlayout in drie kolommen
+            col1, col2, col3 = st.columns([2, 1, 1])
+            
+            # ==================== FYSIEKE TESTING (30-15) ====================
+            with col1:
+                st.markdown('<div class="info-card">', unsafe_allow_html=True)
+                st.markdown("### <span class='accent-blue'>🧪 Fysieke Testing (30-15)</span>", unsafe_allow_html=True)
+                
+                # Laatste testresultaten
+                laatste_test = speler_data.iloc[-1]
+                
+                # Prestatie metrics in 2x2 grid
+                met_col1, met_col2 = st.columns(2)
+                
+                with met_col1:
+                    st.markdown('<div class="metric-box">', unsafe_allow_html=True)
+                    st.metric("🏃‍♂️ MAS", f"{laatste_test['MAS']:.1f} km/u", 
+                             delta=f"{(laatste_test['MAS'] - speler_data.iloc[0]['MAS']):.1f}" if len(speler_data) > 1 else None)
+                    st.markdown('</div>', unsafe_allow_html=True)
+                    
+                    st.markdown('<div class="metric-box">', unsafe_allow_html=True)
+                    st.metric("⚡ Peak Velocity", f"{laatste_test['PeakVelocity']:.1f} km/u")
+                    st.markdown('</div>', unsafe_allow_html=True)
+                
+                with met_col2:
+                    st.markdown('<div class="metric-box">', unsafe_allow_html=True)
+                    st.metric("🫁 VO2Max", f"{laatste_test['VO2MAX']:.1f} ml/kg/min",
+                             delta=f"{(laatste_test['VO2MAX'] - speler_data.iloc[0]['VO2MAX']):.1f}" if len(speler_data) > 1 else None)
+                    st.markdown('</div>', unsafe_allow_html=True)
+                    
+                    st.markdown('<div class="metric-box">', unsafe_allow_html=True)
+                    # Handle potential string/float conversion for FinishingTime
+                    try:
+                        finish_time = float(laatste_test['FinishingTime'])
+                        st.metric("⏱️ Finish Time", f"{finish_time:.1f} s")
+                    except (ValueError, TypeError):
+                        st.metric("⏱️ Finish Time", f"{laatste_test['FinishingTime']} s")
+                    st.markdown('</div>', unsafe_allow_html=True)
+                
+                # Progressie grafiek
+                if len(speler_data) > 1:
+                    fig = make_subplots(
+                        rows=2, cols=1,
+                        subplot_titles=('MAS Ontwikkeling', 'VO2Max Ontwikkeling'),
+                        vertical_spacing=0.1
+                    )
+                    
+                    # MAS grafiek
+                    fig.add_trace(
+                        go.Scatter(
+                            x=speler_data["Maand"],
+                            y=speler_data["MAS"],
+                            mode='lines+markers',
+                            name='MAS',
+                            line=dict(color='#2E86AB', width=3),
+                            marker=dict(size=8)
+                        ),
+                        row=1, col=1
+                    )
+                    
+                    # VO2Max grafiek  
+                    fig.add_trace(
+                        go.Scatter(
+                            x=speler_data["Maand"],
+                            y=speler_data["VO2MAX"],
+                            mode='lines+markers',
+                            name='VO2Max',
+                            line=dict(color='#A23B72', width=3),
+                            marker=dict(size=8)
+                        ),
+                        row=2, col=1
+                    )
+                    
+                    fig.update_layout(
+                        height=500,
+                        showlegend=False,
+                        title_text=f"Prestatie Ontwikkeling - {selected_speler}"
+                    )
+                    
+                    fig.update_xaxes(title_text="Test Maand", row=2, col=1)
+                    fig.update_yaxes(title_text="MAS (km/u)", row=1, col=1)
+                    fig.update_yaxes(title_text="VO2Max (ml/kg/min)", row=2, col=1)
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("📊 Minimaal 2 testresultaten nodig voor progressiegrafiek")
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+                
+                # GPS Prestatie Data ophalen
+                gps_data = con.execute("""
+                    SELECT datum, totale_afstand, hoge_intensiteit_afstand, zeer_hoge_intensiteit_afstand,
+                           sprint_afstand, max_snelheid, aantal_sprints, aantal_acceleraties, 
+                           aantal_deceleraties, impacts, player_load
+                    FROM gps_data 
+                    WHERE speler = ?
+                    ORDER BY datum DESC
+                    LIMIT 30
+                """, (selected_speler,)).fetchall()
+                
+                # GPS Prestaties sectie
+                st.markdown('<div class="section-card">', unsafe_allow_html=True)
+                st.markdown("### <span class='accent-purple'>📊 GPS Prestaties (Training Data)</span>", unsafe_allow_html=True)
+                
+                if gps_data:
+                    df_gps = pd.DataFrame(gps_data, columns=[
+                        'datum', 'totale_afstand', 'hoge_intensiteit_afstand', 'zeer_hoge_intensiteit_afstand',
+                        'sprint_afstand', 'max_snelheid', 'aantal_sprints', 'aantal_acceleraties',
+                        'aantal_deceleraties', 'impacts', 'player_load'
+                    ])
+                    df_gps['datum'] = pd.to_datetime(df_gps['datum'])
+                    
+                    # GPS metrics in 3x2 grid
+                    gps_col1, gps_col2, gps_col3 = st.columns(3)
+                    
+                    # Bereken gemiddeldes voor laatste 30 dagen
+                    with gps_col1:
+                        avg_distance = df_gps['totale_afstand'].mean()
+                        max_distance = df_gps['totale_afstand'].max()
+                        st.metric("🏃‍♂️ Total Distance", f"{avg_distance:.0f}m avg", 
+                                 help=f"Max: {max_distance:.0f}m")
+                        
+                        avg_hsr = df_gps['hoge_intensiteit_afstand'].mean()
+                        max_hsr = df_gps['hoge_intensiteit_afstand'].max()
+                        st.metric("⚡ High Speed Running", f"{avg_hsr:.0f}m avg", 
+                                 help=f"Max: {max_hsr:.0f}m")
+                    
+                    with gps_col2:
+                        avg_sprint = df_gps['sprint_afstand'].mean() if 'sprint_afstand' in df_gps.columns else 0
+                        max_sprint = df_gps['sprint_afstand'].max() if 'sprint_afstand' in df_gps.columns else 0
+                        st.metric("💨 Sprint Distance", f"{avg_sprint:.0f}m avg", 
+                                 help=f"Max: {max_sprint:.0f}m")
+                        
+                        avg_max_speed = df_gps['max_snelheid'].mean()
+                        max_max_speed = df_gps['max_snelheid'].max()
+                        st.metric("🚀 Max Speed", f"{avg_max_speed:.1f} km/u avg", 
+                                 help=f"Peak: {max_max_speed:.1f} km/u")
+                    
+                    with gps_col3:
+                        avg_accelerations = df_gps['aantal_acceleraties'].mean()
+                        max_accelerations = df_gps['aantal_acceleraties'].max()
+                        st.metric("🔺 Acceleraties", f"{avg_accelerations:.1f} avg", 
+                                 help=f"Max: {max_accelerations:.0f}")
+                        
+                        avg_player_load = df_gps['player_load'].mean() if 'player_load' in df_gps.columns else 0
+                        max_player_load = df_gps['player_load'].max() if 'player_load' in df_gps.columns else 0
+                        st.metric("🎯 Player Load", f"{avg_player_load:.1f} avg", 
+                                 help=f"Max: {max_player_load:.1f}")
+                    
+                    # GPS Trend grafiek (laatste 10 sessies)
+                    st.markdown("#### 📈 GPS Prestatie Trends")
+                    
+                    recent_gps = df_gps.head(10).sort_values('datum')
+                    if len(recent_gps) > 1:
+                        fig_gps = make_subplots(
+                            rows=2, cols=2,
+                            subplot_titles=('Total Distance', 'High Speed Running', 'Max Speed', 'Acceleraties'),
+                            vertical_spacing=0.12,
+                            horizontal_spacing=0.1
+                        )
+                        
+                        # Total Distance
+                        fig_gps.add_trace(
+                            go.Scatter(
+                                x=recent_gps['datum'],
+                                y=recent_gps['totale_afstand'],
+                                mode='lines+markers',
+                                name='Total Distance',
+                                line=dict(color='#2E86AB', width=2),
+                                marker=dict(size=6)
+                            ),
+                            row=1, col=1
+                        )
+                        
+                        # High Speed Running
+                        fig_gps.add_trace(
+                            go.Scatter(
+                                x=recent_gps['datum'],
+                                y=recent_gps['hoge_intensiteit_afstand'],
+                                mode='lines+markers',
+                                name='HSR',
+                                line=dict(color='#A23B72', width=2),
+                                marker=dict(size=6)
+                            ),
+                            row=1, col=2
+                        )
+                        
+                        # Max Speed
+                        fig_gps.add_trace(
+                            go.Scatter(
+                                x=recent_gps['datum'],
+                                y=recent_gps['max_snelheid'],
+                                mode='lines+markers',
+                                name='Max Speed',
+                                line=dict(color='#F18F01', width=2),
+                                marker=dict(size=6)
+                            ),
+                            row=2, col=1
+                        )
+                        
+                        # Acceleraties
+                        fig_gps.add_trace(
+                            go.Scatter(
+                                x=recent_gps['datum'],
+                                y=recent_gps['aantal_acceleraties'],
+                                mode='lines+markers',
+                                name='Acceleraties',
+                                line=dict(color='#2E8B57', width=2),
+                                marker=dict(size=6)
+                            ),
+                            row=2, col=2
+                        )
+                        
+                        fig_gps.update_layout(
+                            height=500,
+                            showlegend=False,
+                            title_text=f"GPS Prestaties - Laatste 10 Sessies ({selected_speler})"
+                        )
+                        
+                        # Update axes labels
+                        fig_gps.update_xaxes(title_text="Datum", row=2, col=1)
+                        fig_gps.update_xaxes(title_text="Datum", row=2, col=2)
+                        fig_gps.update_yaxes(title_text="Meters", row=1, col=1)
+                        fig_gps.update_yaxes(title_text="Meters", row=1, col=2)
+                        fig_gps.update_yaxes(title_text="km/u", row=2, col=1)
+                        fig_gps.update_yaxes(title_text="Aantal", row=2, col=2)
+                        
+                        st.plotly_chart(fig_gps, use_container_width=True)
+                    
+                else:
+                    st.info("📈 Nog geen GPS training data beschikbaar voor deze speler")
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            # ==================== ONTWIKKELINGSDOELEN ====================
+            with col2:
+                st.markdown('<div class="info-card">', unsafe_allow_html=True)
+                st.markdown("### <span class='accent-green'>🎯 Ontwikkelingsdoelen</span>", unsafe_allow_html=True)
+                
+                # Haal doelen op uit database
+                doelen = con.execute("""
+                    SELECT doel_id, doeltype, titel, beschrijving, target_datum, status, created_at
+                    FROM speler_doelen 
+                    WHERE speler = ?
+                    ORDER BY created_at DESC
+                    LIMIT 5
+                """, (selected_speler,)).fetchall()
+                
+                if doelen:
+                    # Toon eerste paar doelen
+                    for doel in doelen[:3]:  # Toon max 3 doelen in overzicht
+                        doel_id, doeltype, titel, beschrijving, target_datum, status, created_at = doel
+                        
+                        # Status icoon
+                        status_icons = {
+                            "Actief": "🟢",
+                            "Behaald": "✅", 
+                            "Uitgesteld": "🟡",
+                            "Geannuleerd": "🔴"
+                        }
+                        
+                        target_str = pd.to_datetime(target_datum).date().strftime('%d/%m/%Y')
+                        
+                        st.markdown(f"""
+                        <div class="goal-item">
+                            <strong>{status_icons.get(status, '⚪')} [{doeltype}] {titel}</strong><br>
+                            <small>Doel datum: {target_str} | Status: {status}</small><br>
+                            {beschrijving[:100]}{'...' if len(beschrijving) > 100 else ''}
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    if len(doelen) > 3:
+                        st.caption(f"En {len(doelen) - 3} andere doelen...")
+                    
+                    # Link naar Speler Progressie pagina
+                    st.info("🔗 Voor volledig doelen beheer, ga naar de 'Speler Progressie' pagina.")
+                    
+                else:
+                    st.markdown("""
+                    <div class="goal-item">
+                        <strong>📝 Geen doelen ingesteld</strong><br>
+                        Voeg doelen toe via de 'Speler Progressie' pagina.
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    st.info("🏁 **Ontwikkelingsdoelen** kunnen worden toegevoegd via de 'Speler Progressie' pagina.")
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            # ==================== GESPREKKEN & NOTITIES ====================
+            with col3:
+                st.markdown('<div class="info-card">', unsafe_allow_html=True)
+                st.markdown("### <span class='accent-orange'>💬 Gesprekken & Notities</span>", unsafe_allow_html=True)
+                
+                # Haal gesprekken op uit database
+                gesprekken = con.execute("""
+                    SELECT notitie_id, datum, onderwerp, notities, created_at
+                    FROM gesprek_notities 
+                    WHERE speler = ?
+                    ORDER BY datum DESC
+                    LIMIT 5
+                """, (selected_speler,)).fetchall()
+                
+                if gesprekken:
+                    # Toon eerste paar gesprekken
+                    for gesprek in gesprekken[:3]:  # Toon max 3 gesprekken in overzicht
+                        notitie_id, datum, onderwerp, notities, created_at = gesprek
+                        datum_str = pd.to_datetime(datum).date().strftime('%d/%m/%Y')
+                        
+                        # Kort notitie preview (eerste 80 karakters)
+                        notitie_preview = notities[:80] + '...' if len(notities) > 80 else notities
+                        
+                        st.markdown(f"""
+                        <div class="conversation-item">
+                            <strong>💬 {onderwerp}</strong><br>
+                            <small>{datum_str}</small><br>
+                            {notitie_preview}
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    if len(gesprekken) > 3:
+                        st.caption(f"En {len(gesprekken) - 3} andere gesprekken...")
+                    
+                    # Link naar Speler Progressie pagina
+                    st.info("🔗 Voor volledig gesprekken beheer, ga naar de 'Speler Progressie' pagina.")
+                    
+                else:
+                    st.markdown("""
+                    <div class="conversation-item">
+                        <strong>📝 Geen gesprekken</strong><br>
+                        Voeg gesprekken toe via de 'Speler Progressie' pagina.
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    st.info("💬 **Gesprekken en notities** kunnen worden toegevoegd via de 'Speler Progressie' pagina.")
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+                
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # ==================== GEDETAILLEERDE TESTGEGEVENS ====================
+            st.markdown('<div class="section-card">', unsafe_allow_html=True)
+            st.markdown("### <span class='accent-purple'>📋 Testgeschiedenis</span>", unsafe_allow_html=True)
+            
+            # Voeg progressie kolommen toe
+            display_data = speler_data.copy().sort_values("Maand")
+            display_data["MAS_Progressie"] = display_data["MAS"].diff().round(2)
+            display_data["VO2_Progressie"] = display_data["VO2MAX"].diff().round(1)
+            display_data["MAS_Progressie"] = display_data["MAS_Progressie"].apply(
+                lambda x: f"{x:+.2f}" if pd.notna(x) else "-"
+            )
+            display_data["VO2_Progressie"] = display_data["VO2_Progressie"].apply(
+                lambda x: f"{x:+.1f}" if pd.notna(x) else "-"
+            )
+            
+            # Kolommen voor weergave
+            display_cols = ["Maand", "MAS", "MAS_Progressie", "VO2MAX", "VO2_Progressie", "PeakVelocity", "FinishingTime"]
+            col_names = {
+                "Maand": "Test Datum",
+                "MAS": "MAS (km/u)", 
+                "MAS_Progressie": "MAS Δ",
+                "VO2MAX": "VO2Max (ml/kg/min)",
+                "VO2_Progressie": "VO2Max Δ",
+                "PeakVelocity": "Peak Velocity (km/u)",
+                "FinishingTime": "Finish Time (s)"
+            }
+            
+            result_table = display_data[display_cols].copy()
+            result_table.columns = [col_names[col] for col in display_cols]
+            
+            st.dataframe(
+                result_table,
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # Export opties
+            col_exp1, col_exp2 = st.columns(2)
+            
+            with col_exp1:
+                csv_data = speler_data.to_csv(index=False)
+                st.download_button(
+                    label=f"📥 Download testgegevens CSV",
+                    data=csv_data,
+                    file_name=f"{selected_speler}_spelersoverzicht.csv",
+                    mime="text/csv"
+                )
+            
+            with col_exp2:
+                # PDF rapport zou hier kunnen worden gegenereerd
+                st.button("📄 Genereer PDF rapport", disabled=True, help="Functie in ontwikkeling")
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+
+con.close()

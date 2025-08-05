@@ -1,0 +1,1662 @@
+import streamlit as st
+import pandas as pd
+import duckdb
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, date, timedelta
+import numpy as np
+
+from db_config import get_database_connection
+st.set_page_config(page_title="Match Analysis - SPK Dashboard", layout="wide")
+
+st.title("🏆 Match Analysis Dashboard")
+
+# Database connectie met betere error handling
+try:
+    con = get_database_connection()
+except Exception as e:
+    st.error(f"Database connection error: {e}")
+    st.stop()
+
+# Maak match analysis tabellen aan met transactie
+try:
+    con.execute("BEGIN TRANSACTION")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS matches (
+        match_id INTEGER PRIMARY KEY,
+        datum DATE,
+        tijd TIME,
+        tegenstander VARCHAR,
+        thuis_uit VARCHAR CHECK (thuis_uit IN ('Thuis', 'Uit')),
+        competitie VARCHAR,
+        seizoen VARCHAR,
+        doelpunten_voor INTEGER DEFAULT 0,
+        doelpunten_tegen INTEGER DEFAULT 0,
+        match_type VARCHAR CHECK (match_type IN ('Competitie', 'Vriendschappelijk', 'Beker', 'Play-off')),
+        status VARCHAR CHECK (status IN ('Gepland', 'Gespeeld', 'Geannuleerd')) DEFAULT 'Gepland',
+        weather_conditions VARCHAR,
+        field_conditions VARCHAR,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS match_lineups (
+        lineup_id INTEGER PRIMARY KEY,
+        match_id INTEGER,
+        speler VARCHAR,
+        positie VARCHAR,
+        start_elf BOOLEAN DEFAULT FALSE,
+        minuten_gespeeld INTEGER DEFAULT 0,
+        captain BOOLEAN DEFAULT FALSE,
+        keeper BOOLEAN DEFAULT FALSE,
+        substitute_in_minute INTEGER,
+        substitute_out_minute INTEGER,
+        FOREIGN KEY (match_id) REFERENCES matches(match_id)
+    )
+""")
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS match_events (
+        event_id INTEGER PRIMARY KEY,
+        match_id INTEGER,
+        speler VARCHAR,
+        event_type VARCHAR CHECK (event_type IN ('Goal', 'Assist', 'Gele Kaart', 'Rode Kaart', 'Wissel In', 'Wissel Uit', 'Penalty', 'Eigen Doelpunt')),
+        minuut INTEGER,
+        omschrijving TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (match_id) REFERENCES matches(match_id)
+    )
+""")
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS match_ratings (
+        rating_id INTEGER PRIMARY KEY,
+        match_id INTEGER,
+        speler VARCHAR,
+        rating FLOAT CHECK (rating >= 1 AND rating <= 10),
+        positie VARCHAR,
+        man_of_the_match BOOLEAN DEFAULT FALSE,
+        coach_notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (match_id) REFERENCES matches(match_id)
+    )
+""")
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS opponent_scouting (
+        scout_id INTEGER PRIMARY KEY,
+        match_id INTEGER,
+        formation VARCHAR,
+        key_players TEXT,
+        strengths TEXT,
+        weaknesses TEXT,
+        tactical_notes TEXT,
+        previous_results TEXT,
+        scout_date DATE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (match_id) REFERENCES matches(match_id)
+    )
+""")
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS match_analysis_notes (
+        note_id INTEGER PRIMARY KEY,
+        match_id INTEGER,
+        analysis_type VARCHAR CHECK (analysis_type IN ('Pre-Match', 'Half-Time', 'Post-Match', 'Video Analysis')),
+        notes TEXT,
+        tactical_adjustments TEXT,
+        performance_highlights TEXT,
+        areas_for_improvement TEXT,
+        created_by VARCHAR DEFAULT 'Coach',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (match_id) REFERENCES matches(match_id)
+    )
+""")
+
+    # Maak sequences aan voor de nieuwe tabellen
+    sequences = ['match_id_seq', 'lineup_id_seq', 'event_id_seq', 'rating_id_seq', 'scout_id_seq', 'note_id_seq']
+    for seq in sequences:
+        try:
+            con.execute(f"CREATE SEQUENCE IF NOT EXISTS {seq} START 1")
+        except:
+            pass
+    
+    con.execute("COMMIT")
+    
+except Exception as e:
+    try:
+        con.execute("ROLLBACK")
+    except:
+        pass
+    # Continue without error if tables already exist
+    print(f"Database setup warning: {e}")
+    pass
+
+# Helper function to sync with training calendar
+def sync_with_training_calendar():
+    """Import matches from training calendar (Wedstrijd/Vriendschappelijk types)"""
+    calendar_matches = con.execute("""
+        SELECT training_id, datum, tijd, type, omschrijving
+        FROM trainings_calendar 
+        WHERE type IN ('Wedstrijd', 'Vriendschappelijk', 'Beker')
+        ORDER BY datum
+    """).fetchall()
+    
+    imported_count = 0
+    for cal_match in calendar_matches:
+        training_id, datum, tijd, match_type, omschrijving = cal_match
+        
+        # Check if already exists in matches table
+        existing = con.execute("""
+            SELECT COUNT(*) FROM matches 
+            WHERE datum = ? AND match_type = ? AND (tegenstander LIKE ? OR omschrijving LIKE ?)
+        """, (datum, match_type, f"%{omschrijving[:20]}%", f"%{omschrijving[:20]}%")).fetchone()
+        
+        if existing[0] == 0:  # Not exists, import
+            # Extract opponent from description
+            tegenstander = "TBD"
+            thuis_uit = "Thuis"
+            
+            if omschrijving:
+                # Try to parse opponent from description
+                if " vs " in omschrijving or " tegen " in omschrijving:
+                    if " vs " in omschrijving:
+                        parts = omschrijving.split(" vs ")
+                        if len(parts) >= 2:
+                            tegenstander = parts[1].strip()
+                            # Check if we're mentioned first (away game)
+                            if any(keyword in parts[0].lower() for keyword in ['spk', 'we', 'ons']):
+                                thuis_uit = "Uit"
+                    elif " tegen " in omschrijving:
+                        parts = omschrijving.split(" tegen ")
+                        if len(parts) >= 2:
+                            tegenstander = parts[1].strip()
+                elif "wedstrijd" in omschrijving.lower():
+                    # Extract team name from description
+                    words = omschrijving.split()
+                    for i, word in enumerate(words):
+                        if word.lower() in ['tegen', 'vs', '-']:
+                            if i + 1 < len(words):
+                                tegenstander = ' '.join(words[i+1:]).strip()
+                                break
+                
+                # Determine home/away from description
+                if any(keyword in omschrijving.lower() for keyword in ['uit', 'away', '@']):
+                    thuis_uit = "Uit"
+            
+            # Import to matches table
+            try:
+                con.execute("""
+                    INSERT INTO matches (match_id, datum, tijd, tegenstander, thuis_uit, 
+                                       competitie, seizoen, match_type, status, training_calendar_id)
+                    VALUES (nextval('match_id_seq'), ?, ?, ?, ?, ?, ?, ?, 'Gepland', ?)
+                """, (datum, tijd, tegenstander, thuis_uit, "Hoofdklasse", 
+                     f"{datetime.now().year}/{datetime.now().year+1}", match_type, training_id))
+                imported_count += 1
+            except:
+                # Add training_calendar_id column if it doesn't exist
+                try:
+                    con.execute("ALTER TABLE matches ADD COLUMN training_calendar_id INTEGER")
+                    con.execute("""
+                        INSERT INTO matches (match_id, datum, tijd, tegenstander, thuis_uit, 
+                                           competitie, seizoen, match_type, status, training_calendar_id)
+                        VALUES (nextval('match_id_seq'), ?, ?, ?, ?, ?, ?, ?, 'Gepland', ?)
+                    """, (datum, tijd, tegenstander, thuis_uit, "Hoofdklasse", 
+                         f"{datetime.now().year}/{datetime.now().year+1}", match_type, training_id))
+                    imported_count += 1
+                except:
+                    pass
+    
+    return imported_count
+
+# Main navigation tabs
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🗓️ Matches", "📋 Pre-Match", "⚽ Live/Post-Match", "📊 Analysis", "🎯 Scouting"])
+
+with tab1:
+    st.header("Match Overzicht")
+    
+    # Sync button voor trainingskalender
+    col_sync, col_spacer = st.columns([1, 3])
+    with col_sync:
+        if st.button("🔄 Sync met Trainingskalender", help="Importeer wedstrijden uit de trainingskalender"):
+            imported = sync_with_training_calendar()
+            if imported > 0:
+                st.success(f"✅ {imported} wedstrijd(en) geïmporteerd uit trainingskalender!")
+                st.rerun()
+            else:
+                st.info("ℹ️ Geen nieuwe wedstrijden gevonden in trainingskalender")
+    
+    # Twee kolommen: match toevoegen en overzicht
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.subheader("➕ Nieuwe Match")
+        with st.form("nieuwe_match"):
+            match_datum = st.date_input("📅 Datum", value=date.today())
+            match_tijd = st.time_input("⏰ Tijd", value=datetime.now().time())
+            tegenstander = st.text_input("🆚 Tegenstander")
+            thuis_uit = st.selectbox("🏠 Thuis/Uit", ["Thuis", "Uit"])
+            competitie = st.text_input("🏆 Competitie", value="Hoofdklasse")
+            seizoen = st.text_input("📅 Seizoen", value=f"{datetime.now().year}/{datetime.now().year+1}")
+            match_type = st.selectbox("📝 Type", ["Competitie", "Vriendschappelijk", "Beker", "Play-off"])
+            
+            submit_match = st.form_submit_button("✅ Match Toevoegen")
+            
+            if submit_match and tegenstander:
+                # Add to matches table first
+                match_insert_result = con.execute("""
+                    INSERT INTO matches (match_id, datum, tijd, tegenstander, thuis_uit, competitie, seizoen, match_type)
+                    VALUES (nextval('match_id_seq'), ?, ?, ?, ?, ?, ?, ?)
+                """, (match_datum, match_tijd, tegenstander, thuis_uit, competitie, seizoen, match_type))
+                
+                # Also add to training calendar for consistency
+                try:
+                    calendar_description = f"{match_type} {tegenstander} ({'Thuis' if thuis_uit == 'Thuis' else 'Uit'})"
+                    training_id = con.execute("""
+                        INSERT INTO trainings_calendar (training_id, datum, tijd, type, omschrijving)
+                        VALUES (nextval('training_id_seq'), ?, ?, ?, ?)
+                        RETURNING training_id
+                    """, (match_datum, str(match_tijd), match_type, calendar_description)).fetchone()[0]
+                    
+                    # Update match with calendar link
+                    con.execute("""
+                        UPDATE matches SET training_calendar_id = ? 
+                        WHERE datum = ? AND tegenstander = ? AND match_type = ?
+                    """, (training_id, match_datum, tegenstander, match_type))
+                    
+                    st.success(f"✅ Match tegen {tegenstander} toegevoegd en gekoppeld aan trainingskalender!")
+                except:
+                    st.success(f"✅ Match tegen {tegenstander} toegevoegd!")
+                
+                st.rerun()
+    
+    with col2:
+        st.subheader("📅 Komende & Recente Matches")
+        
+        # Haal matches op (including calendar link)
+        matches = con.execute("""
+            SELECT m.match_id, m.datum, m.tijd, m.tegenstander, m.thuis_uit, m.doelpunten_voor, 
+                   m.doelpunten_tegen, m.match_type, m.status, m.training_calendar_id,
+                   tc.omschrijving as calendar_description
+            FROM matches m
+            LEFT JOIN trainings_calendar tc ON m.training_calendar_id = tc.training_id
+            ORDER BY m.datum DESC, m.tijd DESC
+            LIMIT 15
+        """).fetchall()
+        
+        if matches:
+            for match in matches:
+                match_id, datum, tijd, tegenstander, thuis_uit, goals_for, goals_against, match_type, status, training_calendar_id, calendar_description = match
+                
+                # Format datum
+                datum_obj = pd.to_datetime(datum).date()
+                datum_str = datum_obj.strftime("%d/%m/%Y")
+                tijd_str = tijd.strftime("%H:%M") if tijd else "TBD"
+                
+                # Status indicator
+                if datum_obj < date.today():
+                    if status == 'Gespeeld':
+                        status_badge = f"🟢 {goals_for}-{goals_against}"
+                    else:
+                        status_badge = "🔴 Voorbij"
+                elif datum_obj == date.today():
+                    status_badge = "🟡 Vandaag"
+                else:
+                    status_badge = "⭐ Gepland"
+                
+                location_icon = "🏠" if thuis_uit == "Thuis" else "✈️"
+                calendar_icon = "📅" if training_calendar_id else ""
+                
+                with st.expander(f"{calendar_icon} {location_icon} {tegenstander} - {datum_str} {tijd_str} {status_badge}"):
+                    # Show calendar link info if available
+                    if training_calendar_id:
+                        st.caption(f"🔗 Gekoppeld aan trainingskalender: {calendar_description}")
+                    
+                    col_a, col_b, col_c = st.columns(3)
+                    
+                    with col_a:
+                        if st.button(f"📋 Opstelling", key=f"lineup_{match_id}"):
+                            st.session_state.selected_match_lineup = match_id
+                    
+                    with col_b:
+                        if st.button(f"⚽ Match Data", key=f"events_{match_id}"):
+                            st.session_state.selected_match_events = match_id
+                    
+                    with col_c:
+                        if st.button(f"📊 Analyse", key=f"analysis_{match_id}"):
+                            st.session_state.selected_match_analysis = match_id
+                    
+                    # Add attendance link if connected to calendar
+                    if training_calendar_id:
+                        st.write("**🔗 Trainingskalender Functies:**")
+                        col_att1, col_att2 = st.columns(2)
+                        with col_att1:
+                            if st.button(f"👥 Aanwezigheid", key=f"attendance_{match_id}"):
+                                # Redirect to training calendar with this training selected
+                                st.info(f"💡 Ga naar Trainingskalender om aanwezigheid in te stellen voor training ID: {training_calendar_id}")
+                        with col_att2:
+                            if st.button(f"📝 Training Details", key=f"training_details_{match_id}"):
+                                st.info(f"💡 Bekijk in Trainingskalender voor volledige training details")
+        else:
+            st.info("Nog geen matches toegevoegd.")
+
+with tab2:
+    st.header("📋 Pre-Match Planning")
+    
+    # Auto-sync knop voor nieuwe wedstrijden
+    col_auto_sync, col_spacer = st.columns([1, 2])
+    with col_auto_sync:
+        if st.button("🔄 Auto-Sync Kalender", help="Automatisch nieuwe wedstrijden importeren"):
+            imported = sync_with_training_calendar()
+            if imported > 0:
+                st.success(f"✅ {imported} wedstrijd(en) geïmporteerd!")
+                st.rerun()
+            else:
+                st.info("ℹ️ Alles up-to-date")
+    
+    # Match selectie (inclusief calendar info)
+    matches = con.execute("""
+        SELECT m.match_id, m.datum, m.tegenstander, m.thuis_uit, m.training_calendar_id,
+               tc.omschrijving as calendar_description
+        FROM matches m
+        LEFT JOIN trainings_calendar tc ON m.training_calendar_id = tc.training_id
+        WHERE m.datum >= CURRENT_DATE
+        ORDER BY m.datum
+    """).fetchall()
+    
+    if matches:
+        # Show calendar connection status in match options
+        match_options = []
+        for m in matches:
+            calendar_indicator = "📅" if m[4] else "➕"  # m[4] is training_calendar_id
+            match_options.append(f"{calendar_indicator} {m[1]} - {m[2]} ({'Thuis' if m[3] == 'Thuis' else 'Uit'})")
+        
+        selected_match_idx = st.selectbox("🎯 Selecteer Match", range(len(match_options)), format_func=lambda x: match_options[x])
+        selected_match_id = matches[selected_match_idx][0]
+        selected_calendar_id = matches[selected_match_idx][4]  # training_calendar_id
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("🔍 Tegenstander Scouting")
+            
+            # Haal bestaande scouting op
+            existing_scout = con.execute("""
+                SELECT formation, key_players, strengths, weaknesses, tactical_notes, previous_results
+                FROM opponent_scouting WHERE match_id = ?
+            """, (selected_match_id,)).fetchone()
+            
+            with st.form(f"scouting_{selected_match_id}"):
+                formation = st.text_input("⚽ Formatie", value=existing_scout[0] if existing_scout else "4-4-2")
+                key_players = st.text_area("⭐ Sleutelspelers", value=existing_scout[1] if existing_scout else "")
+                strengths = st.text_area("💪 Sterke Punten", value=existing_scout[2] if existing_scout else "")
+                weaknesses = st.text_area("🎯 Zwakke Punten", value=existing_scout[3] if existing_scout else "")
+                tactical_notes = st.text_area("📝 Tactische Notities", value=existing_scout[4] if existing_scout else "")
+                previous_results = st.text_area("📊 Vorige Resultaten", value=existing_scout[5] if existing_scout else "")
+                
+                if st.form_submit_button("💾 Scouting Opslaan"):
+                    # Delete existing and insert new
+                    con.execute("DELETE FROM opponent_scouting WHERE match_id = ?", (selected_match_id,))
+                    con.execute("""
+                        INSERT INTO opponent_scouting (scout_id, match_id, formation, key_players, strengths, weaknesses, tactical_notes, previous_results, scout_date)
+                        VALUES (nextval('scout_id_seq'), ?, ?, ?, ?, ?, ?, ?, CURRENT_DATE)
+                    """, (selected_match_id, formation, key_players, strengths, weaknesses, tactical_notes, previous_results))
+                    st.success("✅ Scouting opgeslagen!")
+        
+        with col2:
+            st.subheader("👥 Speler Beschikbaarheid")
+            
+            # Show calendar connection status
+            if selected_calendar_id:
+                st.success(f"📅 **Gekoppeld aan trainingskalender** - Training ID: {selected_calendar_id}")
+                
+                # Get attendance from calendar if available
+                attendance_data = con.execute("""
+                    SELECT speler, status FROM training_attendance 
+                    WHERE training_id = ?
+                """, (selected_calendar_id,)).fetchall()
+                
+                if attendance_data:
+                    st.write("**📋 Aanwezigheid uit Trainingskalender:**")
+                    
+                    attending_players = [row[0] for row in attendance_data if row[1] == 'Aanwezig']
+                    absent_players = [row[0] for row in attendance_data if row[1] == 'Afwezig']
+                    
+                    if attending_players:
+                        st.success(f"✅ **Aanwezig ({len(attending_players)})**: {', '.join(attending_players)}")
+                    if absent_players:
+                        st.error(f"❌ **Afwezig ({len(absent_players)})**: {', '.join(absent_players)}")
+                        
+                    # Quick link to manage attendance
+                    if st.button("👥 Aanwezigheid Beheren", key="manage_attendance"):
+                        st.info("💡 Ga naar de Trainingskalender pagina om aanwezigheid aan te passen")
+                else:
+                    st.warning("⚠️ Nog geen aanwezigheid ingesteld in trainingskalender")
+                    if st.button("➕ Aanwezigheid Instellen", key="set_attendance"):
+                        st.info("💡 Ga naar de Trainingskalender pagina om aanwezigheid in te stellen")
+            else:
+                st.info("➕ Deze match is nog niet gekoppeld aan de trainingskalender")
+            
+            # Haal alle spelers op
+            all_players = con.execute("""
+                SELECT DISTINCT speler FROM (
+                    SELECT speler FROM gps_data WHERE speler IS NOT NULL
+                    UNION 
+                    SELECT Speler as speler FROM thirty_fifteen_results WHERE Speler IS NOT NULL
+                    UNION
+                    SELECT naam as speler FROM contact_lijst WHERE functie != 'Hoofdtrainer'
+                ) ORDER BY speler
+            """).fetchall()
+            
+            if all_players:
+                # Toon recente fitness data per speler
+                st.subheader("💪 Recente Fitness Data")
+                for player in all_players[:10]:  # Limit to first 10 for display
+                    player_name = player[0]
+                    
+                    # Haal laatste 30-15 test op
+                    last_test = con.execute("""
+                        SELECT TrueVIFT, MAS, Maand FROM thirty_fifteen_results 
+                        WHERE Speler = ? ORDER BY Maand DESC LIMIT 1
+                    """, (player_name,)).fetchone()
+                    
+                    # Haal recente GPS data op
+                    recent_gps = con.execute("""
+                        SELECT AVG(totale_afstand), AVG(max_snelheid), COUNT(*) as sessions
+                        FROM gps_data 
+                        WHERE speler = ? AND datum >= CURRENT_DATE - INTERVAL '14 days'
+                    """, (player_name,)).fetchone()
+                    
+                    if last_test or recent_gps:
+                        with st.expander(f"📊 {player_name}"):
+                            if last_test:
+                                st.write(f"🏃 **MAS**: {last_test[1]:.1f} km/h (Test: {last_test[2]})")
+                            if recent_gps and recent_gps[2] > 0:
+                                st.write(f"📍 **Recente 14 dagen**: {recent_gps[2]} trainingen")
+                                st.write(f"📏 **Gem. Afstand**: {recent_gps[0]:.0f}m")
+                                st.write(f"⚡ **Gem. Max Snelheid**: {recent_gps[1]:.1f} km/h")
+    else:
+        st.info("📅 Geen komende matches gevonden. Voeg eerst een match toe in de 'Matches' tab.")
+
+with tab3:
+    st.header("⚽ Live & Post-Match")
+    
+    # Match selectie voor events/ratings
+    all_matches = con.execute("""
+        SELECT match_id, datum, tegenstander, thuis_uit, status
+        FROM matches 
+        ORDER BY datum DESC
+        LIMIT 20
+    """).fetchall()
+    
+    if all_matches:
+        match_options = [f"{m[1]} - {m[2]} ({'Thuis' if m[3] == 'Thuis' else 'Uit'}) [{m[4]}]" for m in all_matches]
+        selected_match_idx = st.selectbox("🎯 Selecteer Match voor Events/Ratings", range(len(match_options)), format_func=lambda x: match_options[x])
+        selected_match_id = all_matches[selected_match_idx][0]
+        
+        # Match score input eerst
+        st.subheader("⚽ Match Score")
+        current_match = con.execute("SELECT doelpunten_voor, doelpunten_tegen, status FROM matches WHERE match_id = ?", (selected_match_id,)).fetchone()
+        
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col1:
+            goals_for = st.number_input("🏆 Doelpunten Voor", min_value=0, max_value=20, value=current_match[0] if current_match else 0)
+        with col2:
+            goals_against = st.number_input("🥅 Doelpunten Tegen", min_value=0, max_value=20, value=current_match[1] if current_match else 0)  
+        with col3:
+            match_status = st.selectbox("📊 Status", ["Gepland", "Gespeeld", "Geannuleerd"], 
+                                      index=["Gepland", "Gespeeld", "Geannuleerd"].index(current_match[2]) if current_match else 0)
+        
+        if st.button("💾 Update Match Score", type="primary"):
+            con.execute("""
+                UPDATE matches 
+                SET doelpunten_voor = ?, doelpunten_tegen = ?, status = ?
+                WHERE match_id = ?
+            """, (goals_for, goals_against, match_status, selected_match_id))
+            st.success(f"✅ Score bijgewerkt: {goals_for}-{goals_against} (Status: {match_status})")
+            st.rerun()
+        
+        # Show current score
+        if current_match:
+            if current_match[0] > current_match[1]:
+                st.success(f"🏆 Huidige stand: **{current_match[0]} - {current_match[1]}** (Overwinning!)")
+            elif current_match[0] == current_match[1]:
+                st.info(f"🤝 Huidige stand: **{current_match[0]} - {current_match[1]}** (Gelijkspel)")
+            else:
+                st.error(f"❌ Huidige stand: **{current_match[0]} - {current_match[1]}** (Nederlaag)")
+        
+        st.divider()
+        
+        # Sub-tabs voor verschillende functies
+        subtab1, subtab2, subtab3, subtab4 = st.tabs(["⚽ Events", "⭐ Ratings", "👕 Opstelling", "📝 Notities"])
+        
+        with subtab1:
+            st.subheader("⚽ Match Events")
+            
+            # Haal spelers op BUITEN de form
+            lineup_players = con.execute("""
+                SELECT DISTINCT speler FROM match_lineups WHERE match_id = ?
+                UNION
+                SELECT DISTINCT speler FROM gps_data LIMIT 20
+            """, (selected_match_id,)).fetchall()
+            
+            # Session state voor persistente speler selectie
+            st.write("➕ **Event Toevoegen**")
+            
+            # Initialize session state
+            session_key = f"selected_player_{selected_match_id}"
+            if session_key not in st.session_state:
+                st.session_state[session_key] = None
+                
+            if lineup_players:
+                player_list = sorted([p[0] for p in lineup_players])
+                
+                # Gebruik columns voor inline buttons
+                st.write("👤 **Kies speler:**")
+                
+                # Create button grid
+                cols_per_row = 3
+                for i in range(0, len(player_list), cols_per_row):
+                    cols = st.columns(cols_per_row)
+                    for j in range(cols_per_row):
+                        if i + j < len(player_list):
+                            player = player_list[i + j]
+                            with cols[j]:
+                                is_selected = st.session_state[session_key] == player
+                                button_type = "primary" if is_selected else "secondary"
+                                if st.button(
+                                    player, 
+                                    key=f"btn_{player}_{selected_match_id}",
+                                    type=button_type,
+                                    use_container_width=True
+                                ):
+                                    st.session_state[session_key] = player
+                                    st.rerun()
+                
+                selected_player_dropdown = st.session_state[session_key]
+                
+                if selected_player_dropdown:
+                    st.success(f"✅ Geselecteerd: **{selected_player_dropdown}**")
+                else:
+                    st.info("👆 Klik op een speler om te selecteren")
+                    
+            else:
+                selected_player_dropdown = st.text_input("👤 Speler naam:", key=f"player_input_{selected_match_id}")
+            
+            # Form met de gekozen speler
+            with st.form(f"event_form_{selected_match_id}", clear_on_submit=False):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Toon de geselecteerde speler (read-only)
+                    st.info(f"👤 Gekozen speler: **{selected_player_dropdown}**")
+                    # Gebruik de dropdown waarde
+                    selected_player = selected_player_dropdown
+                
+                with col2:
+                    selected_event_type = st.selectbox(
+                        "⚽ Event Type", 
+                        ["Goal", "Assist", "Gele Kaart", "Rode Kaart", "Wissel In", "Wissel Uit", "Penalty", "Eigen Doelpunt"]
+                    )
+                
+                col3, col4 = st.columns(2)
+                with col3:
+                    selected_minuut = st.number_input("⏱️ Minuut", min_value=1, max_value=120, value=45)
+                with col4:
+                    selected_omschrijving = st.text_area("📝 Omschrijving", height=80)
+                
+                # Debug de form data voor submit
+                st.write("🔍 **Form Debug Info:**")
+                st.write(f"- Speler: '{selected_player}'")
+                st.write(f"- Event: '{selected_event_type}'")
+                st.write(f"- Minuut: {selected_minuut}")
+                
+                # Form submit button
+                submitted = st.form_submit_button("✅ Event Toevoegen", type="primary")
+                
+            # Process form submission OUTSIDE the form to capture correct values
+            if submitted and selected_player:
+                # Store form data in session state to preserve across rerun
+                st.session_state[f'submitted_player_{selected_match_id}'] = selected_player
+                st.session_state[f'submitted_event_{selected_match_id}'] = selected_event_type
+                st.session_state[f'submitted_minuut_{selected_match_id}'] = selected_minuut
+                st.session_state[f'submitted_desc_{selected_match_id}'] = selected_omschrijving
+                
+                st.write("🚀 **Final Submit Debug:**")
+                st.write(f"- Final Speler: '{selected_player}'")
+                st.write(f"- Session Speler: '{st.session_state.get(f'submitted_player_{selected_match_id}', 'NOT_FOUND')}'")
+                
+                # Use session state values for database insert
+                final_player = st.session_state[f'submitted_player_{selected_match_id}']
+                final_event = st.session_state[f'submitted_event_{selected_match_id}']
+                final_minuut = st.session_state[f'submitted_minuut_{selected_match_id}']
+                final_desc = st.session_state[f'submitted_desc_{selected_match_id}']
+                
+                con.execute("""
+                    INSERT INTO match_events (event_id, match_id, speler, event_type, minuut, omschrijving)
+                    VALUES (nextval('event_id_seq'), ?, ?, ?, ?, ?)
+                """, (selected_match_id, final_player, final_event, final_minuut, final_desc))
+                
+                st.success(f"✅ {final_event} voor {final_player} toegevoegd!")
+                
+                # Clean up session state
+                del st.session_state[f'submitted_player_{selected_match_id}']
+                del st.session_state[f'submitted_event_{selected_match_id}']
+                del st.session_state[f'submitted_minuut_{selected_match_id}']
+                del st.session_state[f'submitted_desc_{selected_match_id}']
+                
+                st.rerun()
+            elif submitted:
+                st.error("❌ Selecteer eerst een speler")
+            
+            # Events lijst BUITEN de form
+            st.write("📋 **Match Events Overzicht**")
+            events = con.execute("""
+                SELECT event_id, speler, event_type, minuut, omschrijving, created_at
+                FROM match_events 
+                WHERE match_id = ?
+                ORDER BY minuut
+            """, (selected_match_id,)).fetchall()
+            
+            if events:
+                for event in events:
+                    event_id, speler, event_type, minuut, desc, created = event
+                    icon = {"Goal": "⚽", "Assist": "🅰️", "Gele Kaart": "🟨", "Rode Kaart": "🟥", 
+                           "Wissel In": "🔄", "Wissel Uit": "🔄", "Penalty": "🥅", "Eigen Doelpunt": "🤦"}
+                    
+                    # Event display met delete knop
+                    event_col1, event_col2 = st.columns([4, 1])
+                    
+                    with event_col1:
+                        st.write(f"{icon.get(event_type, '⚽')} **{minuut}'** {speler} - {event_type}")
+                        if desc:
+                            st.caption(desc)
+                    
+                    with event_col2:
+                        if st.button("🗑️", key=f"delete_event_{event_id}", help=f"Verwijder {event_type} van {speler}"):
+                            con.execute("DELETE FROM match_events WHERE event_id = ?", (event_id,))
+                            st.success(f"✅ Event verwijderd!")
+                            st.rerun()
+            else:
+                st.info("Nog geen events geregistreerd voor deze match.")
+        
+        with subtab2:
+            st.subheader("⭐ Speler Ratings")
+            
+            # Bulk rating input - gebruik lineup spelers voor deze match
+            lineup_players = con.execute("""
+                SELECT DISTINCT speler FROM match_lineups WHERE match_id = ?
+                UNION
+                SELECT DISTINCT naam as speler FROM spelers_profiel WHERE naam IS NOT NULL
+                ORDER BY speler
+            """, (selected_match_id,)).fetchall()
+            
+            # Show existing ratings first
+            existing_ratings = con.execute("""
+                SELECT speler, rating, man_of_the_match, coach_notes
+                FROM match_ratings WHERE match_id = ?
+                ORDER BY rating DESC
+            """, (selected_match_id,)).fetchall()
+            
+            if existing_ratings:
+                st.subheader("📊 Huidige Ratings")
+                for rating in existing_ratings:
+                    speler, rating_val, motm, notes = rating
+                    motm_icon = "👑" if motm else ""
+                    color = "success" if rating_val >= 8 else "info" if rating_val >= 6.5 else "warning"
+                    
+                    with st.container():
+                        col1, col2, col3 = st.columns([2, 1, 3])
+                        with col1:
+                            if color == "success":
+                                st.success(f"{motm_icon} **{speler}**")
+                            elif color == "info":
+                                st.info(f"{motm_icon} **{speler}**")
+                            else:
+                                st.warning(f"{motm_icon} **{speler}**")
+                        with col2:
+                            st.metric("Rating", f"{rating_val:.1f}")
+                        with col3:
+                            if notes:
+                                st.caption(f"💭 {notes}")
+                st.divider()
+            
+            all_players = lineup_players
+            
+            if all_players:
+                st.write("📊 **Bulk Rating Input**")
+                
+                # Haal bestaande ratings op
+                existing_ratings = con.execute("""
+                    SELECT speler, rating, man_of_the_match, coach_notes
+                    FROM match_ratings WHERE match_id = ?
+                """, (selected_match_id,)).fetchall()
+                existing_dict = {r[0]: (r[1], r[2], r[3]) for r in existing_ratings}
+                
+                with st.form(f"ratings_{selected_match_id}"):
+                    ratings_data = []
+                    
+                    for player in all_players:
+                        player_name = player[0]
+                        existing = existing_dict.get(player_name, (6.0, False, ""))
+                        
+                        col_a, col_b, col_c, col_d = st.columns([2, 1, 1, 2])
+                        
+                        with col_a:
+                            st.write(player_name)
+                        with col_b:
+                            rating = st.number_input("", min_value=1.0, max_value=10.0, value=existing[0], step=0.1, key=f"rating_{player_name}_{selected_match_id}")
+                        with col_c:
+                            motm = st.checkbox("MOTM", value=existing[1], key=f"motm_{player_name}_{selected_match_id}")
+                        with col_d:
+                            notes = st.text_input("Notities", value=existing[2], key=f"notes_{player_name}_{selected_match_id}")
+                        
+                        ratings_data.append((player_name, rating, motm, notes))
+                    
+                    if st.form_submit_button("💾 Alle Ratings Opslaan"):
+                        # Delete existing ratings for this match
+                        con.execute("DELETE FROM match_ratings WHERE match_id = ?", (selected_match_id,))
+                        
+                        # Insert new ratings
+                        for player_name, rating, motm, notes in ratings_data:
+                            if rating > 1:  # Only save if rating was changed from default
+                                con.execute("""
+                                    INSERT INTO match_ratings (rating_id, match_id, speler, rating, man_of_the_match, coach_notes)
+                                    VALUES (nextval('rating_id_seq'), ?, ?, ?, ?, ?)
+                                """, (selected_match_id, player_name, rating, motm, notes))
+                        
+                        st.success("✅ Alle ratings opgeslagen!")
+                        st.rerun()
+        
+        with subtab3:
+            st.subheader("👕 Opstelling & Speelminuten")
+            
+            # Get all available players
+            all_players = con.execute("""
+                SELECT DISTINCT speler FROM (
+                    SELECT speler FROM gps_data WHERE speler IS NOT NULL
+                    UNION 
+                    SELECT Speler as speler FROM thirty_fifteen_results WHERE Speler IS NOT NULL
+                    UNION
+                    SELECT naam as speler FROM contact_lijst WHERE functie != 'Hoofdtrainer'
+                ) ORDER BY speler
+            """).fetchall()
+            
+            if all_players:
+                st.write("⚽ **Speelminuten Invoer**")
+                
+                # Get existing lineup data for this match
+                existing_lineup = con.execute("""
+                    SELECT speler, positie, start_elf, minuten_gespeeld, captain, keeper, 
+                           substitute_in_minute, substitute_out_minute
+                    FROM match_lineups WHERE match_id = ?
+                    ORDER BY start_elf DESC, speler
+                """, (selected_match_id,)).fetchall()
+                
+                existing_dict = {}
+                for lineup in existing_lineup:
+                    existing_dict[lineup[0]] = {
+                        'positie': lineup[1] or '',
+                        'start_elf': lineup[2] or False,
+                        'minuten_gespeeld': lineup[3] or 0,
+                        'captain': lineup[4] or False,
+                        'keeper': lineup[5] or False,
+                        'sub_in': lineup[6],
+                        'sub_out': lineup[7]
+                    }
+                
+                # Show current match info
+                match_info = con.execute("""
+                    SELECT datum, tegenstander, thuis_uit, status 
+                    FROM matches WHERE match_id = ?
+                """, (selected_match_id,)).fetchone()
+                
+                if match_info:
+                    st.info(f"📅 **{match_info[0]}** - {match_info[1]} ({'Thuis' if match_info[2] == 'Thuis' else 'Uit'}) - Status: {match_info[3]}")
+                
+                with st.form(f"lineup_minutes_{selected_match_id}"):
+                    st.write("**👥 Selecteer Spelers & Voer Speelminuten In:**")
+                    
+                    # Quick preset buttons
+                    col_preset1, col_preset2, col_preset3 = st.columns(3)
+                    with col_preset1:
+                        full_match = st.checkbox("⚡ Volledige wedstrijd (90 min)", key="preset_full")
+                    with col_preset2:
+                        half_match = st.checkbox("⏱️ Halve wedstrijd (45 min)", key="preset_half")
+                    with col_preset3:
+                        custom_minutes = st.number_input("📝 Custom minuten", min_value=0, max_value=120, value=90, key="preset_custom")
+                    
+                    lineup_data = []
+                    starting_eleven_count = 0
+                    
+                    # Create input fields for each player
+                    for i, player in enumerate(all_players):
+                        player_name = player[0]
+                        existing = existing_dict.get(player_name, {
+                            'positie': '', 'start_elf': False, 'minuten_gespeeld': 0, 
+                            'captain': False, 'keeper': False, 'sub_in': None, 'sub_out': None
+                        })
+                        
+                        # Player row
+                        col1, col2, col3, col4, col5, col6, col7 = st.columns([2, 1, 1, 1, 0.5, 0.5, 1])
+                        
+                        with col1:
+                            st.write(f"**{player_name}**")
+                        
+                        with col2:
+                            positie = st.selectbox(
+                                "Positie", 
+                                ["", "GK", "VV", "CV", "LV", "RV", "CDM", "CM", "CAM", "LM", "RM", "LW", "RW", "CF", "ST"],
+                                index=0 if not existing['positie'] else (["", "GK", "VV", "CV", "LV", "RV", "CDM", "CM", "CAM", "LM", "RM", "LW", "RW", "CF", "ST"].index(existing['positie']) if existing['positie'] in ["", "GK", "VV", "CV", "LV", "RV", "CDM", "CM", "CAM", "LM", "RM", "LW", "RW", "CF", "ST"] else 0),
+                                key=f"pos_{i}",
+                                label_visibility="collapsed"
+                            )
+                        
+                        with col3:
+                            start_elf = st.checkbox("Start XI", value=existing['start_elf'], key=f"start_{i}")
+                            if start_elf:
+                                starting_eleven_count += 1
+                        
+                        with col4:
+                            # Default minutes based on presets
+                            default_minutes = existing['minuten_gespeeld']
+                            if full_match and start_elf:
+                                default_minutes = 90
+                            elif half_match and start_elf:
+                                default_minutes = 45
+                            elif start_elf and custom_minutes > 0:
+                                default_minutes = custom_minutes
+                            
+                            minuten = st.number_input(
+                                "Min", 
+                                min_value=0, 
+                                max_value=120, 
+                                value=default_minutes,
+                                key=f"min_{i}",
+                                label_visibility="collapsed"
+                            )
+                        
+                        with col5:
+                            captain = st.checkbox("(C)", value=existing['captain'], key=f"cap_{i}")
+                        
+                        with col6:
+                            keeper = st.checkbox("GK", value=existing['keeper'], key=f"gk_{i}")
+                        
+                        with col7:
+                            if minuten > 0 and not start_elf:
+                                sub_in = st.number_input("Sub in", min_value=1, max_value=120, value=existing['sub_in'] or 60, key=f"sub_in_{i}")
+                            else:
+                                sub_in = None
+                            
+                            if minuten > 0 and minuten < 90 and start_elf:
+                                sub_out = st.number_input("Sub out", min_value=1, max_value=120, value=existing['sub_out'] or minuten, key=f"sub_out_{i}")
+                            else:
+                                sub_out = None
+                        
+                        # Only add to lineup if player has minutes or is in starting XI
+                        if minuten > 0 or start_elf:
+                            lineup_data.append({
+                                'speler': player_name,
+                                'positie': positie,
+                                'start_elf': start_elf,
+                                'minuten_gespeeld': minuten,
+                                'captain': captain,
+                                'keeper': keeper,
+                                'sub_in': sub_in,
+                                'sub_out': sub_out
+                            })
+                    
+                    # Validation warnings
+                    if starting_eleven_count > 11:
+                        st.error(f"⚠️ Te veel spelers in startopstelling: {starting_eleven_count}/11")
+                    elif starting_eleven_count < 11 and starting_eleven_count > 0:
+                        st.warning(f"⚠️ Onvolledige startopstelling: {starting_eleven_count}/11")
+                    
+                    # Captain validation
+                    captains = [p for p in lineup_data if p['captain']]
+                    if len(captains) > 1:
+                        st.warning("⚠️ Meerdere aanvoerders geselecteerd")
+                    elif len(captains) == 0 and lineup_data:
+                        st.info("💡 Geen aanvoerder geselecteerd")
+                    
+                    # Goalkeeper validation
+                    keepers = [p for p in lineup_data if p['keeper']]
+                    if len(keepers) == 0 and starting_eleven_count > 0:
+                        st.warning("⚠️ Geen keeper geselecteerd")
+                    
+                    # Save button
+                    if st.form_submit_button("💾 Opstelling & Minuten Opslaan", type="primary"):
+                        # Delete existing lineup
+                        con.execute("DELETE FROM match_lineups WHERE match_id = ?", (selected_match_id,))
+                        
+                        # Insert new lineup data
+                        for player_data in lineup_data:
+                            con.execute("""
+                                INSERT INTO match_lineups (
+                                    lineup_id, match_id, speler, positie, start_elf, 
+                                    minuten_gespeeld, captain, keeper, substitute_in_minute, substitute_out_minute
+                                ) VALUES (
+                                    nextval('lineup_id_seq'), ?, ?, ?, ?, ?, ?, ?, ?, ?
+                                )
+                            """, (
+                                selected_match_id,
+                                player_data['speler'],
+                                player_data['positie'],
+                                player_data['start_elf'],
+                                player_data['minuten_gespeeld'],
+                                player_data['captain'],
+                                player_data['keeper'],
+                                player_data['sub_in'],
+                                player_data['sub_out']
+                            ))
+                        
+                        st.success(f"✅ Opstelling en speelminuten opgeslagen voor {len(lineup_data)} spelers!")
+                        st.rerun()
+                
+                # Show current lineup summary if exists
+                if existing_lineup:
+                    st.subheader("📋 Huidige Opstelling")
+                    
+                    # Starting XI
+                    starting_xi = [p for p in existing_lineup if p[2]]  # start_elf = True
+                    if starting_xi:
+                        st.write("**🟢 Startopstelling:**")
+                        for player in starting_xi:
+                            speler, positie, start_elf, minuten, captain, keeper, sub_in, sub_out = player
+                            captain_indicator = " (C)" if captain else ""
+                            keeper_indicator = " [GK]" if keeper else ""
+                            sub_indicator = f" (uit: {sub_out}')" if sub_out else ""
+                            st.write(f"• **{speler}** - {positie}{captain_indicator}{keeper_indicator} - {minuten} min{sub_indicator}")
+                    
+                    # Substitutes
+                    subs = [p for p in existing_lineup if not p[2] and p[3] > 0]  # not start_elf but has minutes
+                    if subs:
+                        st.write("**🔄 Wissels:**")
+                        for player in subs:
+                            speler, positie, start_elf, minuten, captain, keeper, sub_in, sub_out = player
+                            sub_indicator = f" (in: {sub_in}')" if sub_in else ""
+                            st.write(f"• **{speler}** - {positie} - {minuten} min{sub_indicator}")
+                    
+                    # Minutes summary
+                    total_minutes = sum([p[3] for p in existing_lineup if p[3]])
+                    average_minutes = total_minutes / len(existing_lineup) if existing_lineup else 0
+                    
+                    col_sum1, col_sum2, col_sum3 = st.columns(3)
+                    with col_sum1:
+                        st.metric("⚽ Spelers Gebruikt", len(existing_lineup))
+                    with col_sum2:
+                        st.metric("⏱️ Totaal Speelminuten", f"{total_minutes} min")
+                    with col_sum3:
+                        st.metric("📊 Gemiddeld per Speler", f"{average_minutes:.0f} min")
+            else:
+                st.info("Geen spelers gevonden in database")
+        
+        with subtab4:
+            st.subheader("📝 Match Notities")
+            
+            analysis_type = st.selectbox("📋 Type Analyse", ["Pre-Match", "Half-Time", "Post-Match", "Video Analysis"])
+            
+            # Haal bestaande notities op
+            existing_notes = con.execute("""
+                SELECT notes, tactical_adjustments, performance_highlights, areas_for_improvement
+                FROM match_analysis_notes 
+                WHERE match_id = ? AND analysis_type = ?
+                ORDER BY created_at DESC LIMIT 1
+            """, (selected_match_id, analysis_type)).fetchone()
+            
+            with st.form(f"notes_{selected_match_id}_{analysis_type}"):
+                notes = st.text_area("📝 Algemene Notities", value=existing_notes[0] if existing_notes else "", height=100)
+                tactical = st.text_area("⚽ Tactische Aanpassingen", value=existing_notes[1] if existing_notes else "", height=100)
+                highlights = st.text_area("⭐ Performance Highlights", value=existing_notes[2] if existing_notes else "", height=100)
+                improvements = st.text_area("🎯 Verbeterpunten", value=existing_notes[3] if existing_notes else "", height=100)
+                
+                if st.form_submit_button("💾 Notities Opslaan"):
+                    con.execute("""
+                        INSERT INTO match_analysis_notes (note_id, match_id, analysis_type, notes, tactical_adjustments, performance_highlights, areas_for_improvement)
+                        VALUES (nextval('note_id_seq'), ?, ?, ?, ?, ?, ?)
+                    """, (selected_match_id, analysis_type, notes, tactical, highlights, improvements))
+                    st.success(f"✅ {analysis_type} notities opgeslagen!")
+                    st.rerun()
+
+with tab4:
+    st.header("📊 Match Analysis & Performance Insights")
+    
+    # Analysis type selector
+    analysis_tabs = st.tabs(["🏆 Seizoen Overzicht", "📈 Performance Trends", "⚽ Goal Analysis", "👥 Speler Impact", "🏠 Thuis vs Uit"])
+    
+    with analysis_tabs[0]:
+        st.subheader("🏆 Seizoen Statistieken Dashboard")
+        
+        # Enhanced season stats with more detail
+        # Get current season dynamically from database
+        current_season = con.execute("SELECT seizoen FROM matches ORDER BY datum DESC LIMIT 1").fetchone()
+        if current_season:
+            season_str = current_season[0]
+        else:
+            season_str = f"{datetime.now().year}/{datetime.now().year+1}"
+            
+        # Debug info
+        st.info(f"📅 Analysing seizoen: **{season_str}**")
+            
+        season_stats = con.execute("""
+            SELECT 
+                COUNT(*) as total_matches,
+                COUNT(CASE WHEN status IN ('Gespeeld', 'Gepland') THEN 1 END) as played,
+                COUNT(CASE WHEN doelpunten_voor > doelpunten_tegen THEN 1 END) as wins,
+                COUNT(CASE WHEN doelpunten_voor = doelpunten_tegen THEN 1 END) as draws,
+                COUNT(CASE WHEN doelpunten_voor < doelpunten_tegen THEN 1 END) as losses,
+                SUM(doelpunten_voor) as goals_for,
+                SUM(doelpunten_tegen) as goals_against,
+                AVG(CAST(doelpunten_voor AS FLOAT)) as avg_goals_for,
+                AVG(CAST(doelpunten_tegen AS FLOAT)) as avg_goals_against
+            FROM matches
+            WHERE seizoen = ?
+        """, (season_str,)).fetchone()
+        
+        if season_stats and season_stats[1] > 0:
+            # Key metrics in columns
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("🏟️ Gespeelde Matches", season_stats[1])
+                win_pct = (season_stats[2] / season_stats[1]) * 100
+                st.metric("📊 Win Percentage", f"{win_pct:.1f}%")
+                
+            with col2:
+                st.metric("🏆 Overwinningen", season_stats[2], delta=None)
+                st.metric("🤝 Gelijkspel", season_stats[3])
+                
+            with col3:
+                st.metric("❌ Nederlagen", season_stats[4])
+                goal_diff = season_stats[5] - season_stats[6]
+                st.metric("⚖️ Doelsaldo", f"+{goal_diff}" if goal_diff > 0 else str(goal_diff))
+                
+            with col4:
+                st.metric("⚽ Doelpunten Voor", season_stats[5])
+                st.metric("🥅 Doelpunten Tegen", season_stats[6])
+            
+            # Performance indicators
+            st.divider()
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("📊 Performance Indicatoren")
+                avg_for = season_stats[7]
+                avg_against = season_stats[8]
+                
+                st.metric("🎯 Gemiddeld Doelpunten Voor", f"{avg_for:.2f} per match")
+                st.metric("🛡️ Gemiddeld Doelpunten Tegen", f"{avg_against:.2f} per match")
+                
+                # Form indicator
+                if win_pct >= 70:
+                    st.success("🔥 Uitstekende vorm!")
+                elif win_pct >= 50:
+                    st.info("👍 Goede vorm")
+                elif win_pct >= 30:
+                    st.warning("⚠️ Matige vorm")
+                else:
+                    st.error("📉 Moeilijke periode")
+                    
+            with col2:
+                st.subheader("🏆 Seizoen Voortgang")
+                
+                # Points calculation (3 for win, 1 for draw)
+                total_points = season_stats[2] * 3 + season_stats[3] * 1
+                max_points = season_stats[1] * 3
+                points_pct = (total_points / max_points) * 100 if max_points > 0 else 0
+                
+                st.metric("🏅 Totaal Punten", total_points)
+                st.metric("📈 Punten Efficiency", f"{points_pct:.1f}%")
+                
+                # Create a simple progress bar
+                progress_bar = st.progress(points_pct / 100)
+                
+        else:
+            st.info("📋 Nog geen gespeelde matches dit seizoen.")
+    
+    with analysis_tabs[1]:
+        st.subheader("📈 Performance Trends & Momentum")
+        
+        # Enhanced trend analysis
+        recent_matches = con.execute("""
+            SELECT 
+                datum, 
+                tegenstander, 
+                doelpunten_voor, 
+                doelpunten_tegen, 
+                thuis_uit,
+                match_type,
+                CASE 
+                    WHEN doelpunten_voor > doelpunten_tegen THEN 'Win'
+                    WHEN doelpunten_voor = doelpunten_tegen THEN 'Draw' 
+                    ELSE 'Loss'
+                END as result
+            FROM matches 
+            WHERE status IN ('Gespeeld', 'Gepland') AND seizoen = ?
+            ORDER BY datum DESC
+            LIMIT 15
+        """, (season_str,)).fetchall()
+        
+        if recent_matches:
+            # Form trend chart
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                # Create enhanced trend visualization
+                df_matches = pd.DataFrame(recent_matches, columns=[
+                    'Datum', 'Tegenstander', 'Voor', 'Tegen', 'Thuis_Uit', 'Type', 'Result'
+                ])
+                
+                # Points for trend line
+                points = []
+                for _, match in df_matches.iterrows():
+                    if match['Result'] == 'Win':
+                        points.append(3)
+                    elif match['Result'] == 'Draw':
+                        points.append(1)
+                    else:
+                        points.append(0)
+                
+                df_matches['Points'] = points
+                df_matches['Cumulative_Points'] = df_matches['Points'].rolling(window=5, min_periods=1).sum()
+                
+                # Trend chart
+                fig = go.Figure()
+                
+                # Add line for points trend
+                fig.add_trace(go.Scatter(
+                    x=df_matches['Datum'], 
+                    y=df_matches['Cumulative_Points'],
+                    mode='lines+markers',
+                    name='5-Match Rolling Points',
+                    line=dict(color='blue', width=3)
+                ))
+                
+                fig.update_layout(
+                    title="📈 Recent Form Trend (Rolling 5-Match Points)",
+                    xaxis_title="Datum",
+                    yaxis_title="Points (5-match window)",
+                    hovermode='x unified'
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+                
+            with col2:
+                st.write("**🔥 Recent Form (Last 10)**")
+                
+                # Form display
+                for _, match in df_matches.head(10).iterrows():
+                    if match['Result'] == 'Win':
+                        st.success(f"✅ vs {match['Tegenstander']} ({match['Voor']}-{match['Tegen']})")
+                    elif match['Result'] == 'Draw':
+                        st.info(f"🤝 vs {match['Tegenstander']} ({match['Voor']}-{match['Tegen']})")
+                    else:
+                        st.error(f"❌ vs {match['Tegenstander']} ({match['Voor']}-{match['Tegen']})")
+                        
+        else:
+            st.info("📊 Geen recente matches voor trend analyse.")
+    
+    with analysis_tabs[2]:
+        st.subheader("⚽ Goal Analysis & Scoring Patterns")
+        
+        # Goal timing analysis
+        goal_events = con.execute("""
+            SELECT 
+                me.minuut,
+                me.event_type,
+                me.speler,
+                m.datum,
+                m.tegenstander,
+                m.thuis_uit
+            FROM match_events me
+            JOIN matches m ON me.match_id = m.match_id
+            WHERE me.event_type IN ('Goal', 'Penalty', 'Eigen Doelpunt')
+            AND m.status IN ('Gespeeld', 'Gepland') AND m.seizoen = ?
+            ORDER BY me.minuut
+        """, (season_str,)).fetchall()
+        
+        if goal_events:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write("**📊 Goal Timing Distribution**")
+                
+                # Create minute bins
+                minutes = [g[0] for g in goal_events]
+                bins = [0, 15, 30, 45, 60, 75, 90, 120]
+                labels = ['0-15', '16-30', '31-45', '46-60', '61-75', '76-90', '90+']
+                
+                # Count goals per period
+                goal_counts = []
+                for i in range(len(bins)-1):
+                    count = sum(1 for m in minutes if bins[i] <= m < bins[i+1])
+                    goal_counts.append(count)
+                
+                # Create bar chart
+                fig = px.bar(
+                    x=labels,
+                    y=goal_counts,
+                    title="Goals per Tijdsperiode",
+                    labels={'x': 'Minuten', 'y': 'Aantal Goals'}
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+            with col2:
+                st.write("**🎯 Top Scorers**")
+                
+                # Top scorers analysis
+                scorer_stats = {}
+                for goal in goal_events:
+                    if goal[1] == 'Goal' or goal[1] == 'Penalty':  # Don't count own goals
+                        speler = goal[2]
+                        if speler in scorer_stats:
+                            scorer_stats[speler] += 1
+                        else:
+                            scorer_stats[speler] = 1
+                
+                # Sort by goals
+                top_scorers = sorted(scorer_stats.items(), key=lambda x: x[1], reverse=True)[:10]
+                
+                for i, (speler, goals) in enumerate(top_scorers):
+                    if i == 0:
+                        st.success(f"🥇 {speler}: {goals} goals")
+                    elif i == 1:
+                        st.info(f"🥈 {speler}: {goals} goals")
+                    elif i == 2:
+                        st.warning(f"🥉 {speler}: {goals} goals")
+                    else:
+                        st.write(f"{i+1}. {speler}: {goals} goals")
+        else:
+            st.info("📊 Nog geen goal data beschikbaar.")
+    
+    with analysis_tabs[3]:
+        st.subheader("👥 Player Impact & Performance Analysis")
+        
+        # Player impact metrics
+        player_stats = con.execute("""
+            SELECT 
+                ml.speler,
+                COUNT(DISTINCT ml.match_id) as matches_played,
+                SUM(ml.minuten_gespeeld) as total_minutes,
+                AVG(CAST(ml.minuten_gespeeld AS FLOAT)) as avg_minutes,
+                SUM(CASE WHEN ml.start_elf THEN 1 ELSE 0 END) as starts,
+                SUM(CASE WHEN ml.captain THEN 1 ELSE 0 END) as captain_games,
+                COUNT(CASE WHEN me.event_type = 'Goal' THEN 1 END) as goals,
+                COUNT(CASE WHEN me.event_type = 'Assist' THEN 1 END) as assists,
+                COUNT(CASE WHEN me.event_type IN ('Gele Kaart', 'Rode Kaart') THEN 1 END) as cards,
+                AVG(CASE WHEN mr.rating IS NOT NULL THEN mr.rating END) as avg_rating
+            FROM match_lineups ml
+            JOIN matches m ON ml.match_id = m.match_id
+            LEFT JOIN match_events me ON ml.match_id = me.match_id AND ml.speler = me.speler
+            LEFT JOIN match_ratings mr ON ml.match_id = mr.match_id AND ml.speler = mr.speler
+            WHERE m.status IN ('Gespeeld', 'Gepland') AND m.seizoen = ?
+            GROUP BY ml.speler
+            HAVING COUNT(DISTINCT ml.match_id) >= 1
+            ORDER BY matches_played DESC, total_minutes DESC
+            LIMIT 20
+        """, (season_str,)).fetchall()
+        
+        if player_stats:
+            # Create comprehensive player stats table
+            df_players = pd.DataFrame(player_stats, columns=[
+                'Speler', 'Matches', 'Totaal_Min', 'Gem_Min', 'Starts', 'Captain', 
+                'Goals', 'Assists', 'Cards', 'Gem_Rating'
+            ])
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write("**📊 Player Performance Overview**")
+                
+                # Format display
+                df_display = df_players.copy()
+                df_display['Speeltijd %'] = (df_display['Gem_Min'] / 90 * 100).round(1)
+                df_display['G+A'] = df_display['Goals'] + df_display['Assists']
+                df_display['Gem_Rating'] = df_display['Gem_Rating'].round(2)
+                
+                st.dataframe(
+                    df_display[['Speler', 'Matches', 'Starts', 'Goals', 'Assists', 'G+A', 'Gem_Rating']],
+                    use_container_width=True
+                )
+                
+            with col2:
+                st.write("**🏆 Impact Players**")
+                
+                # Most valuable players based on different metrics
+                if not df_players['Goals'].isna().all():
+                    top_scorer = df_players.loc[df_players['Goals'].idxmax()]
+                    st.success(f"🥅 Top Scorer: **{top_scorer['Speler']}** ({top_scorer['Goals']} goals)")
+                
+                if not df_players['Assists'].isna().all():
+                    top_assister = df_players.loc[df_players['Assists'].idxmax()]
+                    st.info(f"🎯 Top Assister: **{top_assister['Speler']}** ({top_assister['Assists']} assists)")
+                
+                if not df_players['Gem_Rating'].isna().all():
+                    best_rated = df_players.loc[df_players['Gem_Rating'].idxmax()]
+                    st.success(f"⭐ Highest Rated: **{best_rated['Speler']}** ({best_rated['Gem_Rating']:.2f})")
+                
+                most_played = df_players.loc[df_players['Totaal_Min'].idxmax()]
+                st.info(f"⏱️ Most Minutes: **{most_played['Speler']}** ({most_played['Totaal_Min']} min)")
+        else:
+            st.info("📊 Geen speler statistieken beschikbaar.")
+    
+    with analysis_tabs[4]:
+        st.subheader("🏠 Home vs Away Performance Analysis")
+        
+        # Home vs Away statistics
+        home_away_stats = con.execute("""
+            SELECT 
+                thuis_uit,
+                COUNT(*) as matches,
+                SUM(CASE WHEN doelpunten_voor > doelpunten_tegen THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN doelpunten_voor = doelpunten_tegen THEN 1 ELSE 0 END) as draws,
+                SUM(CASE WHEN doelpunten_voor < doelpunten_tegen THEN 1 ELSE 0 END) as losses,
+                SUM(doelpunten_voor) as goals_for,
+                SUM(doelpunten_tegen) as goals_against,
+                AVG(CAST(doelpunten_voor AS FLOAT)) as avg_goals_for,
+                AVG(CAST(doelpunten_tegen AS FLOAT)) as avg_goals_against
+            FROM matches
+            WHERE status IN ('Gespeeld', 'Gepland') AND seizoen = ?
+            GROUP BY thuis_uit
+        """, (season_str,)).fetchall()
+        
+        if home_away_stats:
+            col1, col2 = st.columns(2)
+            
+            for stats in home_away_stats:
+                location = "🏠 Thuis" if stats[0] == 'Thuis' else "✈️ Uit"
+                matches = stats[1]
+                wins = stats[2]
+                draws = stats[3]
+                losses = stats[4]
+                
+                win_pct = (wins / matches) * 100 if matches > 0 else 0
+                
+                if stats[0] == 'Thuis':
+                    with col1:
+                        st.subheader(f"{location} Prestaties")
+                        st.metric("🏟️ Gespeelde Matches", matches)
+                        st.metric("📊 Win Percentage", f"{win_pct:.1f}%")
+                        st.metric("🏆 Overwinningen", wins)
+                        st.metric("🤝 Gelijkspel", draws)
+                        st.metric("❌ Nederlagen", losses)
+                        st.metric("⚽ Doelpunten Voor", stats[5])
+                        st.metric("🥅 Doelpunten Tegen", stats[6])
+                else:
+                    with col2:
+                        st.subheader(f"{location} Prestaties")
+                        st.metric("🏟️ Gespeelde Matches", matches)
+                        st.metric("📊 Win Percentage", f"{win_pct:.1f}%")
+                        st.metric("🏆 Overwinningen", wins)
+                        st.metric("🤝 Gelijkspel", draws)
+                        st.metric("❌ Nederlagen", losses)
+                        st.metric("⚽ Doelpunten Voor", stats[5])
+                        st.metric("🥅 Doelpunten Tegen", stats[6])
+            
+            # Comparison insights
+            if len(home_away_stats) == 2:
+                home_stats = next(s for s in home_away_stats if s[0] == 'Thuis')
+                away_stats = next(s for s in home_away_stats if s[0] == 'Uit')
+                
+                st.divider()
+                st.subheader("📊 Vergelijking & Insights")
+                
+                home_win_pct = (home_stats[2] / home_stats[1]) * 100 if home_stats[1] > 0 else 0
+                away_win_pct = (away_stats[2] / away_stats[1]) * 100 if away_stats[1] > 0 else 0
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    diff = home_win_pct - away_win_pct
+                    st.metric("🏠 Thuis Voordeel", f"{diff:+.1f}%")
+                    
+                with col2:
+                    home_avg = home_stats[7]
+                    away_avg = away_stats[7]
+                    diff = home_avg - away_avg
+                    st.metric("⚽ Goal Verschil (Thuis vs Uit)", f"{diff:+.2f}")
+                    
+                with col3:
+                    home_conceded = home_stats[8]
+                    away_conceded = away_stats[8]
+                    diff = away_conceded - home_conceded
+                    st.metric("🛡️ Defensive Voordeel Thuis", f"{diff:+.2f}")
+                
+                # Insights
+                if home_win_pct > away_win_pct + 10:
+                    st.success("🏠 Sterk thuisvoordeel! Team presteert significant beter thuis.")
+                elif away_win_pct > home_win_pct + 10:
+                    st.info("✈️ Uitstekend uitteam! Team presteert beter op bezoek.")
+                else:
+                    st.info("⚖️ Consistente prestaties thuis en uit.")
+        else:
+            st.info("📊 Geen thuis/uit statistieken beschikbaar.")
+    
+    speelminuten_data = con.execute("""
+        SELECT 
+            ml.speler,
+            COUNT(*) as matches_played,
+            SUM(ml.minuten_gespeeld) as total_minutes,
+            AVG(ml.minuten_gespeeld::FLOAT) as avg_minutes,
+            SUM(CASE WHEN ml.start_elf THEN 1 ELSE 0 END) as starts,
+            SUM(CASE WHEN ml.captain THEN 1 ELSE 0 END) as captain_games,
+            MAX(m.datum) as last_match
+        FROM match_lineups ml
+        JOIN matches m ON ml.match_id = m.match_id
+        WHERE m.status = 'Gespeeld' AND ml.minuten_gespeeld > 0
+        GROUP BY ml.speler
+        HAVING COUNT(*) >= 1
+        ORDER BY total_minutes DESC
+        LIMIT 15
+    """).fetchall()
+    
+    if speelminuten_data:
+        df_minutes = pd.DataFrame(speelminuten_data, columns=[
+            'Speler', 'Matches', 'Totaal Min', 'Gem. Min', 'Starts', 'Aanvoerder', 'Laatste Match'
+        ])
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Playing time table
+            st.write("**📊 Speelminuten Overzicht:**")
+            # Format the dataframe for better display
+            df_display = df_minutes.copy()
+            df_display['Speeltijd %'] = (df_display['Gem. Min'] / 90 * 100).round(1)
+            df_display['Totaal Min'] = df_display['Totaal Min'].astype(str) + " min"
+            df_display['Gem. Min'] = df_display['Gem. Min'].round(0).astype(str) + " min"
+            
+            st.dataframe(df_display[['Speler', 'Matches', 'Starts', 'Totaal Min', 'Gem. Min', 'Speeltijd %']], 
+                        use_container_width=True)
+        
+        with col2:
+            # Average minutes visualization
+            fig = px.bar(df_minutes.head(10), 
+                        x='Speler', 
+                        y='Gem. Min', 
+                        title="Gemiddelde Speelminuten per Match",
+                        color='Starts',
+                        color_continuous_scale='viridis')
+            fig.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Position analysis
+        st.subheader("🎯 Positionele Speelminuten")
+        
+        position_data = con.execute("""
+            SELECT 
+                ml.positie,
+                COUNT(*) as appearances,
+                AVG(ml.minuten_gespeeld::FLOAT) as avg_minutes,
+                SUM(ml.minuten_gespeeld) as total_minutes,
+                COUNT(DISTINCT ml.speler) as unique_players
+            FROM match_lineups ml
+            JOIN matches m ON ml.match_id = m.match_id
+            WHERE m.status = 'Gespeeld' AND ml.positie IS NOT NULL AND ml.positie != ''
+            GROUP BY ml.positie
+            ORDER BY total_minutes DESC
+        """).fetchall()
+        
+        if position_data:
+            df_positions = pd.DataFrame(position_data, columns=[
+                'Positie', 'Optredens', 'Gem. Min', 'Totaal Min', 'Spelers'
+            ])
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Position distribution
+                fig = px.pie(df_positions, values='Totaal Min', names='Positie', 
+                           title="Speelminuten Verdeling per Positie")
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                # Position table
+                st.write("**🎯 Positie Statistieken:**")
+                df_pos_display = df_positions.copy()
+                df_pos_display['Gem. Min'] = df_pos_display['Gem. Min'].round(0)
+                st.dataframe(df_pos_display, use_container_width=True)
+        
+        # Rotation analysis
+        st.subheader("🔄 Team Rotatie & Belasting")
+        
+        rotation_stats = con.execute("""
+            SELECT 
+                COUNT(DISTINCT ml.speler) as total_players_used,
+                AVG(ml.minuten_gespeeld::FLOAT) as avg_minutes_all,
+                COUNT(*) as total_appearances,
+                COUNT(DISTINCT m.match_id) as total_matches
+            FROM match_lineups ml
+            JOIN matches m ON ml.match_id = m.match_id
+            WHERE m.status = 'Gespeeld' AND ml.minuten_gespeeld > 0
+        """).fetchone()
+        
+        if rotation_stats:
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("👥 Spelers Gebruikt", rotation_stats[0])
+            with col2:
+                st.metric("⏱️ Gem. Speelminuten", f"{rotation_stats[1]:.0f} min")
+            with col3:
+                st.metric("📊 Totaal Optredens", rotation_stats[2])
+            with col4:
+                if rotation_stats[3] > 0:
+                    rotation_rate = rotation_stats[2] / (rotation_stats[3] * 11)  # Ideal would be 1.0
+                    st.metric("🔄 Rotatie Index", f"{rotation_rate:.2f}")
+        
+        # Minutes distribution analysis
+        st.write("**📈 Speelminuten Distributie:**")
+        
+        # Categorize players by playing time
+        high_minutes = len([p for p in speelminuten_data if p[3] >= 75])  # avg >= 75 min
+        medium_minutes = len([p for p in speelminuten_data if 30 <= p[3] < 75])  # 30-74 min
+        low_minutes = len([p for p in speelminuten_data if p[3] < 30])  # < 30 min
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("🟢 Reguliere Spelers", high_minutes, help="Gemiddeld ≥75 min per wedstrijd")
+        with col2:
+            st.metric("🟡 Rotatie Spelers", medium_minutes, help="Gemiddeld 30-74 min per wedstrijd")
+        with col3:
+            st.metric("🔴 Impact Spelers", low_minutes, help="Gemiddeld <30 min per wedstrijd")
+    
+    else:
+        st.info("Nog geen speelminuten data beschikbaar. Voer eerst speelminuten in bij gespeelde wedstrijden.")
+    
+    # Team ratings analysis
+    st.subheader("⭐ Team Rating Analysis")
+    
+    rating_analysis = con.execute("""
+        SELECT 
+            mr.speler,
+            AVG(mr.rating) as avg_rating,
+            COUNT(*) as matches_rated,
+            COUNT(CASE WHEN mr.man_of_the_match THEN 1 END) as motm_count
+        FROM match_ratings mr
+        JOIN matches m ON mr.match_id = m.match_id
+        WHERE m.status = 'Gespeeld'
+        GROUP BY mr.speler
+        HAVING COUNT(*) >= 1
+        ORDER BY avg_rating DESC
+        LIMIT 15
+    """).fetchall()
+    
+    if rating_analysis:
+        df_ratings = pd.DataFrame(rating_analysis, columns=['Speler', 'Gemiddelde Rating', 'Matches', 'MOTM Count'])
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.dataframe(df_ratings, use_container_width=True)
+        
+        with col2:
+            # Create bar chart of average ratings
+            fig = px.bar(df_ratings.head(10), x='Speler', y='Gemiddelde Rating', 
+                        title="Top 10 Spelers - Gemiddelde Rating")
+            fig.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Nog geen ratings beschikbaar voor analyse.")
+
+with tab5:
+    st.header("🎯 Advanced Scouting")
+    
+    st.subheader("📊 Tegenstander Database")
+    
+    # Haal alle tegenstanders op met statistieken
+    opponent_stats = con.execute("""
+        SELECT 
+            tegenstander,
+            COUNT(*) as matches_played,
+            COUNT(CASE WHEN doelpunten_voor > doelpunten_tegen THEN 1 END) as wins,
+            COUNT(CASE WHEN doelpunten_voor = doelpunten_tegen THEN 1 END) as draws,
+            COUNT(CASE WHEN doelpunten_voor < doelpunten_tegen THEN 1 END) as losses,
+            AVG(doelpunten_voor::FLOAT) as avg_goals_for,
+            AVG(doelpunten_tegen::FLOAT) as avg_goals_against
+        FROM matches
+        WHERE status = 'Gespeeld'
+        GROUP BY tegenstander
+        ORDER BY matches_played DESC
+    """).fetchall()
+    
+    if opponent_stats:
+        df_opponents = pd.DataFrame(opponent_stats, 
+                                  columns=['Tegenstander', 'Gespeeld', 'Gewonnen', 'Gelijk', 'Verloren', 'Gem. Doelpunten Voor', 'Gem. Doelpunten Tegen'])
+        
+        # Add win percentage
+        df_opponents['Win %'] = (df_opponents['Gewonnen'] / df_opponents['Gespeeld'] * 100).round(1)
+        
+        st.dataframe(df_opponents, use_container_width=True)
+        
+        # Opponent analysis chart
+        if len(df_opponents) > 1:
+            fig = px.scatter(df_opponents, x='Gem. Doelpunten Voor', y='Gem. Doelpunten Tegen', 
+                           size='Gespeeld', hover_name='Tegenstander',
+                           title="Tegenstander Performance Matrix")
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Nog geen tegenstander data beschikbaar.")
+    
+    # Historical scouting notes
+    st.subheader("📝 Scouting Historie")
+    scouting_history = con.execute("""
+        SELECT 
+            m.datum, m.tegenstander, os.formation, os.strengths, os.weaknesses
+        FROM opponent_scouting os
+        JOIN matches m ON os.match_id = m.match_id
+        ORDER BY m.datum DESC
+        LIMIT 5
+    """).fetchall()
+    
+    if scouting_history:
+        for scout in scouting_history:
+            with st.expander(f"🔍 {scout[1]} - {scout[0]}"):
+                st.write(f"**Formatie**: {scout[2]}")
+                st.write(f"**Sterke Punten**: {scout[3]}")
+                st.write(f"**Zwakke Punten**: {scout[4]}")
+    else:
+        st.info("Nog geen scouting historie beschikbaar.")
+
+# Close database connection
+con.close()

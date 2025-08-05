@@ -1,0 +1,289 @@
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+
+# Supabase helpers (primary)
+try:
+    from supabase_helpers import (
+        get_table_data, 
+        get_thirty_fifteen_results, 
+        get_cached_player_list,
+        test_supabase_connection,
+        check_table_exists
+    )
+    SUPABASE_MODE = True
+except ImportError:
+    # Fallback to legacy
+    from db_config import get_database_connection
+    from database_helpers import check_table_exists, get_table_columns, add_column_if_not_exists, safe_fetchdf
+    SUPABASE_MODE = False
+st.set_page_config(page_title="Individueel Overzicht - SPK Dashboard", layout="wide")
+
+st.title("📈 Individueel Overzicht")
+
+if SUPABASE_MODE:
+    # Supabase mode - modern approach
+    st.info("🌐 Connected to Supabase database")
+    
+    # Test connection
+    if not test_supabase_connection():
+        st.error("❌ Cannot connect to Supabase. Please check configuration.")
+        st.stop()
+    
+    # Check if thirty_fifteen_results table exists
+    if not check_table_exists("thirty_fifteen_results"):
+        st.warning("📭 Er zijn nog geen testresultaten beschikbaar.")
+        st.stop()
+    
+    # Get all thirty_fifteen test data
+    all_data = get_thirty_fifteen_results()
+    
+    # Calculate MAS if not present
+    if not all_data.empty and 'MAS' not in all_data.columns:
+        all_data['MAS'] = all_data['TrueVIFT'] * 0.95
+    
+    # Get all active players
+    all_players_list = get_cached_player_list()
+    
+    if not all_players_list and not all_data.empty:
+        # Fallback to players with test results
+        all_players_list = sorted(all_data["Speler"].unique())
+    
+    all_players = pd.DataFrame({'naam': all_players_list})
+
+else:
+    # Legacy mode - fallback to original code
+    con = get_database_connection()
+    
+    # Database migratie: MAS kolom toevoegen indien nodig
+    try:
+        existing_columns = get_table_columns(con, "thirty_fifteen_results")
+        
+        if add_column_if_not_exists(con, "thirty_fifteen_results", "MAS", "DOUBLE"):
+            con.execute("UPDATE thirty_fifteen_results SET MAS = TrueVIFT * 0.95 WHERE MAS IS NULL")
+    except:
+        pass
+
+    # Check of er data is
+    table_exists = check_table_exists(con, "thirty_fifteen_results")
+
+    if not table_exists:
+        st.warning("📭 Er zijn nog geen testresultaten beschikbaar.")
+        st.stop()
+    
+    # Haal alle data op
+    all_data = safe_fetchdf(con, "SELECT * FROM thirty_fifteen_results ORDER BY Maand DESC, Speler")
+    
+    # Check en bereken MAS als deze niet bestaat
+    if 'MAS' not in all_data.columns:
+        all_data['MAS'] = all_data['TrueVIFT'] * 0.95
+    
+    # Haal ALLE actieve spelers op
+    try:
+        all_players_query = """
+            SELECT DISTINCT naam 
+            FROM spelers_profiel 
+            WHERE status = 'Actief'
+            ORDER BY naam
+        """
+        all_players = safe_fetchdf(con, all_players_query)
+        
+        if all_players.empty:
+            # Fallback naar spelers met testresultaten
+            all_players = pd.DataFrame({'naam': sorted(all_data["Speler"].unique()) if len(all_data) > 0 else []})
+    except:
+        all_players = pd.DataFrame({'naam': sorted(all_data["Speler"].unique()) if len(all_data) > 0 else []})
+    
+    if all_players.empty:
+        st.warning("📭 Geen spelers gevonden. Voeg eerst spelers toe via Spelersbeheer.")
+    else:
+        # Speler selectie (alle spelers, ook zonder testdata)
+        spelers = all_players['naam'].tolist()
+        selected_speler = st.selectbox("👤 Selecteer speler", spelers)
+        
+        # Metric keuze voor visualisatie
+        viz_metric = st.radio("📊 Selecteer metric voor analyse", ["MAS (Aanbevolen)", "TrueVIFT", "VO2Max", "Alle"], horizontal=True)
+        
+        # Filter data voor geselecteerde speler
+        if len(all_data) > 0:
+            speler_data = all_data[all_data["Speler"] == selected_speler].sort_values("Maand")
+        else:
+            speler_data = pd.DataFrame()
+        
+        if len(speler_data) == 0:
+            # Toon speler zonder testdata
+            st.info(f"📊 **{selected_speler}** - Geen 30-15 testresultaten beschikbaar")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("#### 💪 Huidige Status")
+                st.write("🔬 **30-15 Test:** Nog niet uitgevoerd")
+                st.write("📈 **Fitness Level:** Onbekend")
+                st.write("🎯 **Aanbeveling:** Plan een 30-15 test in")
+                
+                # Check andere beschikbare data
+                st.markdown("#### 📊 Andere Beschikbare Data")
+                
+                # GPS data check
+                gps_check = con.execute("""
+                    SELECT COUNT(*) FROM gps_data WHERE speler = ?
+                """, (selected_speler,)).fetchone()[0]
+                
+                if gps_check > 0:
+                    st.write(f"✅ GPS Data: {gps_check} sessies beschikbaar")
+                else:
+                    st.write("❌ GPS Data: Geen data")
+                
+                # RPE data check  
+                rpe_check = con.execute("""
+                    SELECT COUNT(*) FROM rpe_data WHERE speler = ?
+                """, (selected_speler,)).fetchone()[0]
+                
+                if rpe_check > 0:
+                    st.write(f"✅ RPE Data: {rpe_check} sessies beschikbaar")
+                else:
+                    st.write("❌ RPE Data: Geen data")
+            
+            with col2:
+                st.markdown("#### 🎯 Volgende Stappen")
+                st.write("1. **30-15 Test Plannen**")
+                st.write("   • Zorg voor goede weersomstandigheden")
+                st.write("   • Plan test op begin van trainingsweek")
+                st.write("   • Zorg voor adequate warming-up")
+                st.write("")
+                st.write("2. **Data Verzameling**")
+                st.write("   • GPS tracker tijdens trainingen")
+                st.write("   • RPE scores na elke sessie")
+                st.write("   • Regelmatige herhaaltests")
+                
+                # Link naar andere pagina's
+                st.markdown("#### 🔗 Gerelateerde Pagina's")
+                st.write("• **Fysieke Training Analyse** voor GPS data")
+                st.write("• **Spelersbeheer** voor profiel informatie")
+                st.write("• **Team Compleet** voor vergelijking met team")
+        else:
+            # Overzicht in kolommen
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                # Progressie grafiek
+                if len(speler_data) > 1:
+                    fig = go.Figure()
+                    
+                    if viz_metric in ["MAS (Aanbevolen)", "Alle"]:
+                        fig.add_trace(go.Scatter(
+                            x=speler_data["Maand"],
+                            y=speler_data["MAS"],
+                            mode='lines+markers',
+                            name='MAS (Maximum Aerobic Speed)',
+                            line=dict(color='#2E86AB', width=3),
+                            marker=dict(size=8)
+                        ))
+                    
+                    if viz_metric in ["TrueVIFT", "Alle"]:
+                        fig.add_trace(go.Scatter(
+                            x=speler_data["Maand"],
+                            y=speler_data["TrueVIFT"],
+                            mode='lines+markers',
+                            name='TrueVIFT',
+                            line=dict(color='#1f77b4', width=3),
+                            marker=dict(size=8),
+                            yaxis='y2' if viz_metric == "Alle" else 'y'
+                        ))
+                    
+                    if viz_metric in ["VO2Max", "Alle"]:
+                        fig.add_trace(go.Scatter(
+                            x=speler_data["Maand"],
+                            y=speler_data["VO2MAX"],
+                            mode='lines+markers',
+                            name='VO2Max',
+                            line=dict(color='#ff7f0e', width=3),
+                            marker=dict(size=8),
+                            yaxis='y3' if viz_metric == "Alle" else 'y'
+                        ))
+                    
+                    if viz_metric == "Alle":
+                        fig.update_layout(
+                            yaxis=dict(title="MAS (km/u)", side="left"),
+                            yaxis2=dict(title="TrueVIFT (km/u)", side="right", overlaying="y", position=0.95),
+                            yaxis3=dict(title="VO2Max (ml/kg/min)", side="right", overlaying="y", position=1.0)
+                        )
+                    else:
+                        if viz_metric == "MAS (Aanbevolen)":
+                            y_title = "MAS (km/u)"
+                        elif viz_metric == "TrueVIFT":
+                            y_title = "TrueVIFT (km/u)"
+                        else:
+                            y_title = "VO2Max (ml/kg/min)"
+                        fig.update_layout(yaxis_title=y_title)
+                    
+                    fig.update_layout(
+                        title=f"Progressie - {selected_speler}",
+                        xaxis_title="Test Maand",
+                        height=400
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("📊 Minimaal 2 testresultaten nodig voor progressiegrafiek")
+            
+            with col2:
+                # Statistieken
+                laatste_test = speler_data.iloc[-1]
+                st.metric("🎯 Laatste MAS", f"{laatste_test['TrueVIFT']:.1f} km/u")
+                st.metric("🫁 Laatste VO2Max", f"{laatste_test['VO2MAX']:.1f} ml/kg/min")
+                st.metric("🎂 Leeftijd", f"{laatste_test['Leeftijd']} jaar")
+                st.metric("📅 Laatste test", laatste_test['Maand'])
+                
+                if len(speler_data) > 1:
+                    eerste_test = speler_data.iloc[0]
+                    verschil_mas = laatste_test['TrueVIFT'] - eerste_test['TrueVIFT']
+                    verschil_vo2 = laatste_test['VO2MAX'] - eerste_test['VO2MAX']
+                    st.metric("📈 MAS Progressie", f"{verschil_mas:+.1f} km/u")
+                    st.metric("📈 VO2Max Progressie", f"{verschil_vo2:+.1f} ml/kg/min")
+            
+            # Gedetailleerde tabel
+            st.subheader("📋 Alle testresultaten")
+            
+            # Voeg progressie kolom toe
+            display_data = speler_data.copy()
+            display_data = display_data.sort_values("Maand")
+            display_data["MAS_Progressie"] = display_data["TrueVIFT"].diff().round(1)
+            display_data["VO2_Progressie"] = display_data["VO2MAX"].diff().round(1)
+            display_data["MAS_Progressie"] = display_data["MAS_Progressie"].apply(
+                lambda x: f"{x:+.1f}" if pd.notna(x) else "-"
+            )
+            display_data["VO2_Progressie"] = display_data["VO2_Progressie"].apply(
+                lambda x: f"{x:+.1f}" if pd.notna(x) else "-"
+            )
+            
+            # Kolommen voor weergave
+            display_cols = ["Maand", "TrueVIFT", "MAS_Progressie", "VO2MAX", "VO2_Progressie", "Leeftijd"]
+            col_names = {
+                "Maand": "Test Maand",
+                "TrueVIFT": "MAS (km/u)",
+                "MAS_Progressie": "MAS Δ (km/u)",
+                "VO2MAX": "VO2Max (ml/kg/min)",
+                "VO2_Progressie": "VO2Max Δ (ml/kg/min)",
+                "Leeftijd": "Leeftijd"
+            }
+            
+            result_table = display_data[display_cols].copy()
+            result_table.columns = [col_names[col] for col in display_cols]
+            
+            st.dataframe(
+                result_table,
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # Export individuele data
+            csv_individual = speler_data.to_csv(index=False)
+            st.download_button(
+                label=f"📥 Download {selected_speler} gegevens",
+                data=csv_individual,
+                file_name=f"{selected_speler}_testresultaten.csv",
+                mime="text/csv"
+            )
+
+con.close()

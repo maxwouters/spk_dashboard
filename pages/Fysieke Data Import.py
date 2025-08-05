@@ -1,0 +1,1408 @@
+import streamlit as st
+
+# Supabase helpers (primary)
+try:
+    from supabase_helpers import (
+        get_table_data, 
+        get_thirty_fifteen_results, 
+        get_cached_player_list,
+        test_supabase_connection,
+        safe_fetchdf,
+        check_table_exists
+    )
+    SUPABASE_MODE = True
+except ImportError:
+    # Fallback to legacy
+    from db_config import get_database_connection
+    from database_helpers import check_table_exists, get_table_columns, add_column_if_not_exists, safe_fetchdf
+    SUPABASE_MODE = False
+import pandas as pd
+from datetime import datetime, timedelta, date
+import plotly.express as px
+import plotly.graph_objects as go
+import numpy as np
+import json
+import io
+import os
+
+def ensure_player_in_database(con, speler_naam, positie="Onbekend"):
+    """Zorgt ervoor dat een speler beschikbaar is voor GPS/RPE data"""
+    # Voor GPS/RPE import is het niet kritiek of de speler in een specifieke tabel staat
+    # De GPS data wordt altijd geïmporteerd, ongeacht of de speler al bekend is
+    
+    # Check of speler al bestaat in verschillende tabellen (stil)
+    try:
+        # Check speler_doelen
+        existing_in_doelen = (lambda result: result[0] if result else None)(execute_db_query("""
+            SELECT speler FROM speler_doelen WHERE speler = ? LIMIT 1
+        """, (speler_naam,)))
+        
+        if existing_in_doelen:
+            return True
+            
+        # Check thirty_fifteen_results  
+        existing_in_tests = (lambda result: result[0] if result else None)(execute_db_query("""
+            SELECT speler FROM thirty_fifteen_results WHERE speler = ? LIMIT 1
+        """, (speler_naam,)))
+        
+        if existing_in_tests:
+            return True
+            
+        # Check gps_data (als speler al GPS data heeft)
+        existing_in_gps = (lambda result: result[0] if result else None)(execute_db_query("""
+            SELECT speler FROM gps_data WHERE speler = ? LIMIT 1
+        """, (speler_naam,)))
+        
+        if existing_in_gps:
+            return True
+            
+        # Als speler nergens bestaat, probeer toe te voegen aan speler_doelen
+        execute_db_query("""
+            INSERT INTO speler_doelen (speler, doel_categorie, doel_waarde, target_datum)
+            VALUES (?, ?, ?, ?)
+        """, (speler_naam, "GPS Tracking", "Actief", datetime.now().date()))
+        
+        return True
+        
+    except Exception as e:
+        # Als alles faalt, gewoon doorgaan - GPS data wordt wel geïmporteerd
+        return True
+
+
+# Database compatibility functions
+def execute_db_query(query, params=None):
+    """Execute query and return results compatible with both databases"""
+    if SUPABASE_MODE:
+        try:
+            df = safe_fetchdf(query, params or {})
+            if df.empty:
+                return []
+            # Convert DataFrame to list of tuples (like fetchall())
+            return [tuple(row) for row in df.values]
+        except Exception as e:
+            st.error(f"Query failed: {e}")
+            return []
+    else:
+        # Legacy mode
+        try:
+            if params:
+                return execute_db_query(query, params)
+            else:
+                return execute_db_query(query)
+        except Exception as e:
+            st.error(f"Legacy query failed: {e}")
+            return []
+
+def get_supabase_data(table_name, columns="*", where_conditions=None):
+    """Get data using Supabase helpers"""
+    if SUPABASE_MODE:
+        return get_table_data(table_name, columns, where_conditions)
+    else:
+        # Legacy fallback
+        query = f"SELECT {columns} FROM {table_name}"
+        if where_conditions:
+            conditions = [f"{k} = '{v}'" for k, v in where_conditions.items()]
+            query += f" WHERE {' AND '.join(conditions)}"
+        return safe_fetchdf(query)
+
+st.set_page_config(page_title="SPK Dashboard - Fysieke Data Import", layout="wide")
+
+st.subheader("📊 Fysieke Data Import & Monitoring")
+
+# Database setup
+if SUPABASE_MODE:
+    st.info("🌐 Using Supabase database")
+    if not test_supabase_connection():
+        st.error("❌ Cannot connect to Supabase")
+        st.stop()
+    con = None  # Will use Supabase helpers
+else:
+    # Legacy mode
+    # Legacy mode fallback
+    try:
+        con = get_database_connection()
+    except NameError:
+        st.error("❌ Database connection not available")
+        st.stop()
+# Database tabellen voor fysieke data
+execute_db_query("""
+    CREATE TABLE IF NOT EXISTS gps_data (
+        gps_id INTEGER PRIMARY KEY,
+        speler TEXT,
+        datum DATE,
+        training_id INTEGER,
+        session_duur_minuten INTEGER,
+        totale_afstand REAL,
+        hoge_intensiteit_afstand REAL,  -- High Speed Running (Absolute) from GPS data
+        zeer_hoge_intensiteit_afstand REAL,  -- >20 km/h
+        sprint_afstand REAL,  -- >25 km/h
+        max_snelheid REAL,
+        gem_snelheid REAL,
+        aantal_acceleraties INTEGER,  -- >3 m/s²
+        aantal_deceleraties INTEGER,  -- <-3 m/s²
+        aantal_sprints INTEGER,
+        aantal_richtingveranderingen INTEGER,
+        player_load REAL,  -- Cumulatieve belasting
+        metabolic_power_avg REAL,
+        metabolic_power_max REAL,
+        distance_zones TEXT,  -- JSON: {"0-10": 1200, "10-15": 800, ...}
+        speed_zones TEXT,  -- JSON: {"0-10": 300, "10-15": 250, ...}
+        positie TEXT,  -- Speler positie
+        impacts INTEGER,  -- Aantal impacts
+        hml_efforts INTEGER,  -- High Metabolic Load efforts
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (training_id) REFERENCES trainings_calendar(training_id)
+    )
+""")
+
+execute_db_query("""
+    CREATE TABLE IF NOT EXISTS heart_rate_data (
+        hr_id INTEGER PRIMARY KEY,
+        speler TEXT,
+        datum DATE,
+        training_id INTEGER,
+        session_duur_minuten INTEGER,
+        gemiddelde_hr INTEGER,
+        maximale_hr INTEGER,
+        rust_hr INTEGER,
+        hr_reserve REAL,  -- (max_hr - rust_hr)
+        tijd_zone1 INTEGER,  -- <60% HRmax (minuten)
+        tijd_zone2 INTEGER,  -- 60-70% HRmax
+        tijd_zone3 INTEGER,  -- 70-80% HRmax
+        tijd_zone4 INTEGER,  -- 80-90% HRmax
+        tijd_zone5 INTEGER,  -- >90% HRmax
+        trimp_edwards REAL,  -- Edwards TRIMP score
+        hrv_score REAL,  -- Heart Rate Variability
+        stress_score REAL,  -- Training Stress Score
+        recovery_tijd_uren INTEGER,  -- Aanbevolen recovery tijd
+        hr_zones_data TEXT,  -- JSON met gedetailleerde zone data
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (training_id) REFERENCES trainings_calendar(training_id)
+    )
+""")
+
+execute_db_query("""
+    CREATE TABLE IF NOT EXISTS rpe_data (
+        rpe_id INTEGER PRIMARY KEY,
+        speler TEXT,
+        datum DATE,
+        training_id INTEGER,
+        rpe_score INTEGER,  -- 1-10 RPE schaal
+        rpe_categorie TEXT,  -- Zeer Licht, Licht, Matig, etc.
+        slaap_kwaliteit INTEGER,  -- 1-10
+        energie_voor_training INTEGER,  -- 1-10
+        energie_na_training INTEGER,  -- 1-10
+        spierpijn_voor INTEGER,  -- 1-10
+        spierpijn_na INTEGER,  -- 1-10
+        algemeen_welzijn INTEGER,  -- 1-10
+        stress_level INTEGER,  -- 1-10
+        motivatie INTEGER,  -- 1-10
+        opmerkingen TEXT,
+        session_load REAL,  -- RPE x Duration (training load)
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (training_id) REFERENCES trainings_calendar(training_id)
+    )
+""")
+
+execute_db_query("""
+    CREATE TABLE IF NOT EXISTS recovery_data (
+        recovery_id INTEGER PRIMARY KEY,
+        speler TEXT,
+        datum DATE,
+        slaap_duur REAL,  -- uren
+        slaap_kwaliteit INTEGER,  -- 1-10
+        slaap_efficiency REAL,  -- percentage
+        rust_hartslag INTEGER,
+        hrv_morning REAL,
+        stress_level INTEGER,  -- 1-10
+        energie_level INTEGER,  -- 1-10
+        spierpijn_level INTEGER,  -- 1-10
+        hydratatie_status TEXT,  -- Goed/Matig/Slecht
+        lichaamsgewicht REAL,
+        lichaamsvetpercentage REAL,
+        recovery_score REAL,  -- Berekende overall recovery (1-100)
+        aanbevelingen TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+execute_db_query("""
+    CREATE TABLE IF NOT EXISTS data_import_log (
+        import_id INTEGER PRIMARY KEY,
+        bestandsnaam TEXT,
+        import_datum TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        data_type TEXT,  -- GPS, HR, Movement, Recovery
+        aantal_records INTEGER,
+        success_rate REAL,
+        errors TEXT,
+        verwerkt_door TEXT
+    )
+""")
+
+# Sequences maken
+try:
+    execute_db_query("CREATE SEQUENCE IF NOT EXISTS gps_id_seq START 1")
+    execute_db_query("CREATE SEQUENCE IF NOT EXISTS hr_id_seq START 1")
+    execute_db_query("CREATE SEQUENCE IF NOT EXISTS rpe_id_seq START 1")
+    execute_db_query("CREATE SEQUENCE IF NOT EXISTS recovery_id_seq START 1")
+    execute_db_query("CREATE SEQUENCE IF NOT EXISTS import_id_seq START 1")
+except:
+    pass
+
+# Helper functies
+def calculate_edwards_trimp(hr_data, duration_minutes, max_hr, rest_hr):
+    """Bereken Edwards TRIMP score"""
+    hr_reserve = max_hr - rest_hr
+    if hr_reserve <= 0:
+        return 0
+    
+    # Edwards zones en multipliers
+    zones = [
+        (0.5, 1),   # Zone 1: 50-60% HRR
+        (0.6, 2),   # Zone 2: 60-70% HRR  
+        (0.7, 3),   # Zone 3: 70-80% HRR
+        (0.8, 4),   # Zone 4: 80-90% HRR
+        (0.9, 5),   # Zone 5: 90-100% HRR
+    ]
+    
+    # Simulatie van tijd in elke zone (normaal zou dit uit HR data komen)
+    trimp = 0
+    for threshold, multiplier in zones:
+        # Geschatte tijd in zone gebaseerd op gemiddelde HR
+        target_hr = rest_hr + (hr_reserve * threshold)
+        time_in_zone = duration_minutes * 0.2  # Simpele verdeling
+        trimp += time_in_zone * multiplier
+    
+    return trimp
+
+def get_rpe_category(rpe_score):
+    """Classificeer RPE score naar categorie"""
+    rpe_categories = {
+        1: ("Zeer Licht", "#2ECC71"),
+        2: ("Zeer Licht", "#2ECC71"), 
+        3: ("Licht", "#58D68D"),
+        4: ("Matig", "#F7DC6F"),
+        5: ("Matig", "#F39C12"),
+        6: ("Zwaar", "#E67E22"),
+        7: ("Zwaar", "#E74C3C"),
+        8: ("Zeer Zwaar", "#C0392B"),
+        9: ("Zeer Zwaar", "#922B21"),
+        10: ("Maximaal", "#7B241C")
+    }
+    return rpe_categories.get(rpe_score, ("Onbekend", "#BDC3C7"))
+
+def calculate_session_load(rpe_score, duration_minutes):
+    """Bereken session load (RPE x Duration)"""
+    return rpe_score * duration_minutes
+
+def classify_training_load(gps_data, hr_data=None):
+    """Classificeer trainingsbelasting op basis van GPS data"""
+    load_score = 0
+    
+    # GPS componenten
+    if gps_data.get('totale_afstand', 0) > 8000:
+        load_score += 2
+    if gps_data.get('hoge_intensiteit_afstand', 0) > 1500:
+        load_score += 2
+    if gps_data.get('aantal_sprints', 0) > 15:
+        load_score += 1
+    
+    if load_score >= 5:
+        return "Zeer Hoog", "#E74C3C"
+    elif load_score >= 3:
+        return "Hoog", "#E67E22"
+    elif load_score >= 1:
+        return "Gemiddeld", "#F39C12"
+    else:
+        return "Laag", "#2ECC71"
+
+def parse_csv_data(uploaded_file, data_type):
+    """Parse geüploade CSV data op basis van type"""
+    try:
+        # Probeer verschillende delimiters
+        try:
+            df = pd.read_csv(uploaded_file, sep=';')
+        except:
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file, sep=',')
+        
+        parsed_data = []
+        
+        if data_type == "GPS":
+            # Check for SPK GPS data format (semicolon separated)
+            if 'Player Name' in df.columns and 'Session Date' in df.columns:
+                # SPK GPS data format mapping
+                for _, row in df.iterrows():
+                    # Parse datum in DD/MM/YYYY format
+                    try:
+                        datum_str = row['Session Date']
+                        datum = pd.to_datetime(datum_str, format='%d/%m/%Y').date()
+                    except:
+                        datum = pd.to_datetime(datum_str).date()
+                    
+                    parsed_data.append({
+                        'speler': row['Player Name'],
+                        'datum': datum,
+                        'session_duur_minuten': 90,  # Standaard training duur
+                        'totale_afstand': float(row['Distance Total']),
+                        'hoge_intensiteit_afstand': float(row.get('High Speed Running (Absolute)', 0)),  # High Speed Running
+                        'zeer_hoge_intensiteit_afstand': float(row.get('Distance Zone 5 (Absolute)', 0)),
+                        'sprint_afstand': float(row.get('Distance Zone 6 (Absolute)', 0)),  # Sprint Meters
+                        'max_snelheid': float(row['Max Speed']),  # Maximale Snelheid
+                        'gem_snelheid': float(row['Distance Total']) / 90 * 0.06,  # Schatting gem snelheid
+                        'aantal_acceleraties': int(row.get('Accelerations Z4 to Z6', 0)),  # Acceleraties
+                        'aantal_deceleraties': int(row.get('Decelerations Z4 to Z6', 0)),  # Deceleraties
+                        'aantal_sprints': int(row.get('Sprints', 0)),  # Sprints
+                        'aantal_richtingveranderingen': int(row.get('Number of High Intensity Bursts', 0)),
+                        'player_load': float(row.get('HML Distance', 0)),
+                        'metabolic_power_avg': float(row.get('Speed Intensity', 0)),
+                        'metabolic_power_max': float(row.get('Explosive Distance', 0)),
+                        'positie': row.get('Player Position', 'Onbekend'),
+                        'impacts': int(row.get('Impacts', 0)),
+                        'hml_efforts': int(row.get('HML Efforts', 0))
+                    })
+            else:
+                # Origineel format
+                required_columns = ['speler', 'datum', 'totale_afstand', 'max_snelheid']
+                for col in required_columns:
+                    if col not in df.columns:
+                        st.error(f"Vereiste kolom '{col}' niet gevonden in GPS data")
+                        return None
+                
+                for _, row in df.iterrows():
+                    parsed_data.append({
+                        'speler': row['speler'],
+                        'datum': pd.to_datetime(row['datum']).date(),
+                        'session_duur_minuten': row.get('session_duur_minuten', 90),
+                        'totale_afstand': row['totale_afstand'],
+                        'hoge_intensiteit_afstand': row.get('hoge_intensiteit_afstand', 0),
+                        'zeer_hoge_intensiteit_afstand': row.get('zeer_hoge_intensiteit_afstand', 0),
+                        'sprint_afstand': row.get('sprint_afstand', 0),
+                        'max_snelheid': row['max_snelheid'],
+                        'gem_snelheid': row.get('gem_snelheid', 0),
+                        'aantal_acceleraties': row.get('aantal_acceleraties', 0),
+                        'aantal_deceleraties': row.get('aantal_deceleraties', 0),
+                        'aantal_sprints': row.get('aantal_sprints', 0),
+                        'aantal_richtingveranderingen': row.get('aantal_richtingveranderingen', 0),
+                        'player_load': row.get('player_load', 0),
+                        'metabolic_power_avg': row.get('metabolic_power_avg', 0),
+                        'metabolic_power_max': row.get('metabolic_power_max', 0)
+                    })
+        
+        elif data_type == "Heart Rate":
+            required_columns = ['speler', 'datum', 'gemiddelde_hr', 'maximale_hr']
+            for col in required_columns:
+                if col not in df.columns:
+                    st.error(f"Vereiste kolom '{col}' niet gevonden in HR data")
+                    return None
+            
+            for _, row in df.iterrows():
+                parsed_data.append({
+                    'speler': row['speler'],
+                    'datum': pd.to_datetime(row['datum']).date(),
+                    'session_duur_minuten': row.get('session_duur_minuten', 90),
+                    'gemiddelde_hr': row['gemiddelde_hr'],
+                    'maximale_hr': row['maximale_hr'],
+                    'rust_hr': row.get('rust_hr', 60),
+                    'tijd_zone1': row.get('tijd_zone1', 0),
+                    'tijd_zone2': row.get('tijd_zone2', 0),
+                    'tijd_zone3': row.get('tijd_zone3', 0),
+                    'tijd_zone4': row.get('tijd_zone4', 0),
+                    'tijd_zone5': row.get('tijd_zone5', 0),
+                    'hrv_score': row.get('hrv_score', 0),
+                    'stress_score': row.get('stress_score', 0),
+                    'recovery_tijd_uren': row.get('recovery_tijd_uren', 24)
+                })
+        
+        return parsed_data
+    
+    except Exception as e:
+        st.error(f"Fout bij parsen van data: {str(e)}")
+        return None
+
+# Tabs voor verschillende functies
+tab1, tab2, tab3 = st.tabs([
+    "📤 Data Import", 
+    "📊 GPS Monitoring", 
+    "🎯 RPE Data"
+])
+
+with tab1:
+    st.markdown("### 📤 Fysieke Data Import")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("#### 📁 Data Upload")
+        
+        data_type = st.selectbox("📊 Data Type", 
+                               ["GPS"])
+        
+        uploaded_file = st.file_uploader(f"Upload {data_type} CSV bestand", 
+                                       type=['csv'],
+                                       help=f"Upload een CSV bestand met {data_type} data")
+        
+        if uploaded_file is not None:
+            st.success(f"✅ Bestand '{uploaded_file.name}' geüpload")
+            
+            # Preview van de data
+            try:
+                # Probeer verschillende delimiters
+                try:
+                    df_preview = pd.read_csv(uploaded_file, sep=';')
+                except:
+                    uploaded_file.seek(0)
+                    df_preview = pd.read_csv(uploaded_file, sep=',')
+                
+                st.markdown("**📋 Data Preview:**")
+                st.dataframe(df_preview.head(), use_container_width=True)
+                
+                # Reset file pointer
+                uploaded_file.seek(0)
+                
+                col_a, col_b = st.columns(2)
+                
+                with col_a:
+                    st.metric("📊 Aantal Records", len(df_preview))
+                with col_b:
+                    st.metric("📂 Aantal Kolommen", len(df_preview.columns))
+                
+                # Training selectie voor koppeling
+                st.markdown("#### 🔗 Training Koppeling")
+                
+                # Haal beschikbare trainingen op
+                available_trainings = execute_db_query("""
+                    SELECT training_id, datum, type, omschrijving 
+                    FROM trainings_calendar 
+                    WHERE datum >= ? 
+                    ORDER BY datum DESC
+                """, (datetime.now().date() - timedelta(days=30),))
+                
+                if available_trainings:
+                    training_options = []
+                    training_map = {}
+                    
+                    for training in available_trainings:
+                        training_id, datum, t_type, omschrijving = training
+                        display_text = f"{datum} - {t_type}"
+                        if omschrijving:
+                            display_text += f" ({omschrijving[:30]}...)" if len(omschrijving) > 30 else f" ({omschrijving})"
+                        
+                        training_options.append(display_text)
+                        training_map[display_text] = training_id
+                    
+                    selected_training_display = st.selectbox(
+                        "🎯 Selecteer Training om te koppelen:",
+                        ["Geen koppeling"] + training_options,
+                        help="Koppel deze fysieke data aan een specifieke training uit de kalender"
+                    )
+                    
+                    selected_training_id = None
+                    if selected_training_display != "Geen koppeling":
+                        selected_training_id = training_map[selected_training_display]
+                        st.info(f"📎 Data wordt gekoppeld aan training ID: {selected_training_id}")
+                else:
+                    st.warning("⚠️ Geen trainingen gevonden in de laatste 30 dagen. Maak eerst trainingen aan in de Training Planning.")
+                    selected_training_id = None
+                
+                # Import button
+                if st.button(f"🚀 Importeer {data_type} Data"):
+                    # Valideer training datum als training is geselecteerd
+                    if selected_training_id and data_type == "GPS":
+                        # Haal training datum op
+                        training_datum = (lambda result: result[0] if result else None)(execute_db_query("""
+                            SELECT datum FROM trainings_calendar WHERE training_id = ?
+                        """, (selected_training_id,)))
+                        
+                        if training_datum:
+                            # Parse CSV om datums te controleren
+                            uploaded_file.seek(0)
+                            try:
+                                df_check = pd.read_csv(uploaded_file, sep=';')
+                            except:
+                                uploaded_file.seek(0)
+                                df_check = pd.read_csv(uploaded_file, sep=',')
+                            
+                            # Check datum kolom
+                            datum_col = None
+                            if 'Session Date' in df_check.columns:
+                                datum_col = 'Session Date'
+                                data_datums = pd.to_datetime(df_check[datum_col], format='%d/%m/%Y').dt.date.unique()
+                            elif 'datum' in df_check.columns:
+                                datum_col = 'datum'
+                                data_datums = pd.to_datetime(df_check[datum_col]).dt.date.unique()
+                            
+                            if datum_col and training_datum[0] not in data_datums:
+                                st.warning(f"⚠️ Let op: Training datum ({training_datum[0]}) komt niet overeen met data datums ({', '.join(map(str, data_datums))})")
+                                st.info("💡 Je kunt toch doorgaan - de koppeling wordt alsnog gemaakt.")
+                        
+                        uploaded_file.seek(0)  # Reset file pointer
+                    
+                    # Parse data
+                    parsed_data = parse_csv_data(uploaded_file, data_type)
+                    
+                    if parsed_data:
+                        success_count = 0
+                        errors = []
+                        
+                        try:
+                            if data_type == "GPS":
+                                for record in parsed_data:
+                                    # Zorg ervoor dat speler in database staat
+                                    ensure_player_in_database(con, record['speler'], record.get('positie', 'Onbekend'))
+                                    
+                                    # Check voor duplicaten voordat we invoegen
+                                    existing_record = (lambda result: result[0] if result else None)(execute_db_query("""
+                                        SELECT gps_id FROM gps_data 
+                                        WHERE speler = ? AND datum = ? AND training_id = ?
+                                    """, (record['speler'], record['datum'], selected_training_id)))
+                                    
+                                    if existing_record:
+                                        st.warning(f"⚠️ GPS data voor {record['speler']} op {record['datum']} bestaat al - wordt overgeslagen")
+                                        continue
+                                    
+                                    # Fixed: Use Supabase client for GPS insert
+                                    from supabase_config import get_supabase_client
+                                    client = get_supabase_client()
+                                    
+                                    # Get next GPS ID
+                                    existing_df = safe_fetchdf("SELECT MAX(gps_id) as max_id FROM gps_data")
+                                    next_id = 1 if existing_df.empty or existing_df['max_id'].iloc[0] is None else existing_df['max_id'].iloc[0] + 1
+                                    
+                                    # Insert GPS data
+                                    try:
+                                        result = client.table('gps_data').insert({
+                                            'gps_id': next_id,
+                                            'speler': record['speler'],
+                                            'datum': str(record['datum']),
+                                            'training_id': selected_training_id,
+                                            'session_duur_minuten': record['session_duur_minuten'],
+                                            'totale_afstand': record['totale_afstand'],
+                                            'hoge_intensiteit_afstand': record['hoge_intensiteit_afstand'],
+                                            'zeer_hoge_intensiteit_afstand': record['zeer_hoge_intensiteit_afstand'],
+                                            'sprint_afstand': record['sprint_afstand'],
+                                            'max_snelheid': record['max_snelheid'],
+                                            'gem_snelheid': record['gem_snelheid'],
+                                            'aantal_acceleraties': record['aantal_acceleraties'],
+                                            'aantal_deceleraties': record['aantal_deceleraties'],
+                                            'aantal_sprints': record['aantal_sprints'],
+                                            'aantal_richtingveranderingen': record['aantal_richtingveranderingen'],
+                                            'player_load': record['player_load'],
+                                            'metabolic_power_avg': record['metabolic_power_avg'],
+                                            'metabolic_power_max': record['metabolic_power_max'],
+                                            'positie': record.get('positie', 'Onbekend'),
+                                            'impacts': record.get('impacts', 0),
+                                            'hml_efforts': record.get('hml_efforts', 0)
+                                        }).execute()
+                                        
+                                        if result.data:
+                                            success_count += 1
+                                        else:
+                                            st.error(f"❌ GPS data voor {record['speler']} kon niet worden opgeslagen")
+                                    except Exception as e:
+                                        st.error(f"❌ Fout bij opslaan GPS data voor {record['speler']}: {str(e)}")
+                            
+                            # Log import
+                            success_rate = (success_count / len(parsed_data)) * 100
+                            execute_db_query("""
+                                INSERT INTO data_import_log 
+                                (import_id, bestandsnaam, data_type, aantal_records, success_rate, errors)
+                                VALUES (nextval('import_id_seq'), ?, ?, ?, ?, ?)
+                            """, (uploaded_file.name, data_type, len(parsed_data), success_rate, json.dumps(errors)))
+                            
+                            st.success(f"✅ {success_count}/{len(parsed_data)} records succesvol geïmporteerd!")
+                            
+                            if errors:
+                                st.warning(f"⚠️ {len(errors)} fouten opgetreden tijdens import")
+                                with st.expander("Bekijk fouten"):
+                                    for error in errors:
+                                        st.text(error)
+                        
+                        except Exception as e:
+                            st.error(f"❌ Import gefaald: {str(e)}")
+                            
+            except Exception as e:
+                st.error(f"❌ Fout bij lezen bestand: {str(e)}")
+    
+    with col2:
+        st.markdown("#### 📋 Data Format Specificaties")
+        
+        format_specs = {
+            "GPS": {
+                "required": ["Player Name/speler", "Session Date/datum", "Distance Total/totale_afstand", "Max Speed/max_snelheid"],
+                "optional": ["Player Position", "Distance Z4 to Z6", "Distance Z4ToZ6Ab", "High Speed Running (Absolute)",
+                           "Distance Zone 5 (Absolute)", "Distance Zone 6 (Absolute)", "Sprints", "Accelerations Z4 to Z6", 
+                           "Deceleration Z4 to Z6", "Number of High Intensity Bursts", "Impacts", "HML Efforts", "Speed Intensity", "Explosive Distance"],
+                "example": {
+                    "Player Name": "John Doe",
+                    "Session Date": "21/07/2025", 
+                    "Distance Total": 8540.5,
+                    "Max Speed": 28.4,
+                    "Player Position": "Winger"
+                }
+            }
+        }
+        
+        if data_type in format_specs:
+            spec = format_specs[data_type]
+            
+            st.markdown("**📌 Vereiste Kolommen:**")
+            for col in spec["required"]:
+                st.write(f"• {col}")
+            
+            st.markdown("**📌 Optionele Kolommen:**")
+            for col in spec["optional"][:8]:  # Toon eerste 8
+                st.write(f"• {col}")
+            if len(spec["optional"]) > 8:
+                st.write(f"• ... en {len(spec['optional']) - 8} meer")
+            
+            st.markdown("**📝 Voorbeeld Record:**")
+            example_df = pd.DataFrame([spec["example"]])
+            st.dataframe(example_df, use_container_width=True)
+        
+        # Import geschiedenis
+        st.markdown("#### 📊 Import Geschiedenis")
+        
+        import_history = execute_db_query("""
+            SELECT bestandsnaam, data_type, aantal_records, success_rate, import_datum
+            FROM data_import_log
+            ORDER BY import_datum DESC
+            LIMIT 5
+        """)
+        
+        if import_history:
+            df_history = pd.DataFrame(import_history, columns=[
+                'Bestand', 'Type', 'Records', 'Success %', 'Datum'
+            ])
+            st.dataframe(df_history, use_container_width=True)
+        else:
+            st.info("📭 Nog geen import geschiedenis")
+
+with tab2:
+    st.markdown("### 📊 GPS Data Monitoring")
+    
+    # GPS data ophalen met training informatie (fix for Supabase)
+    try:
+        gps_df = safe_fetchdf("SELECT * FROM gps_data ORDER BY datum DESC")
+        
+        # Work directly with the DataFrame (no tuple conversion needed)
+        if not gps_df.empty:
+            # Add missing columns
+            gps_df['training_type'] = 'Training'  # Default value 
+            gps_df['training_opmerkingen'] = ''  # Default value
+            
+            # Convert date column
+            gps_df['datum'] = pd.to_datetime(gps_df['datum'])
+            
+            # Convert numeric columns from strings (fix Supabase string format)
+            numeric_columns = [
+                'totale_afstand', 'hoge_intensiteit_afstand', 'zeer_hoge_intensiteit_afstand',
+                'sprint_afstand', 'max_snelheid', 'gem_snelheid', 'aantal_acceleraties',
+                'aantal_deceleraties', 'aantal_sprints', 'aantal_richtingveranderingen',
+                'player_load', 'metabolic_power_avg', 'metabolic_power_max', 'impacts', 'hml_efforts'
+            ]
+            
+            for col in numeric_columns:
+                if col in gps_df.columns:
+                    # Convert strings to numeric, handling any conversion errors
+                    gps_df[col] = pd.to_numeric(gps_df[col], errors='coerce').fillna(0)
+            
+            # Use the dataframe directly
+            df_gps = gps_df
+            gps_data = True  # Set flag to show data exists
+        else:
+            gps_data = False
+    except Exception as e:
+        st.error(f"Error loading GPS data: {e}")
+        gps_data = False
+    
+    if gps_data:
+        
+        # Filter opties in kolommen
+        col_filter1, col_filter2, col_filter3 = st.columns(3)
+        
+        with col_filter1:
+            # Speler selectie
+            speler_filter = st.selectbox("👤 Selecteer Speler", ["Alle"] + df_gps['speler'].unique().tolist())
+        
+        with col_filter2:
+            # Datum range selectie
+            min_date = df_gps['datum'].min().date()
+            max_date = df_gps['datum'].max().date()
+            
+            start_date = st.date_input(
+                "📅 Start Datum", 
+                value=min_date,
+                min_value=min_date,
+                max_value=max_date,
+                key="gps_start_date"
+            )
+            
+        with col_filter3:
+            end_date = st.date_input(
+                "📅 Eind Datum", 
+                value=max_date,
+                min_value=min_date,
+                max_value=max_date,
+                key="gps_end_date"
+            )
+        
+        # Validatie datum range
+        if start_date > end_date:
+            st.error("⚠️ Start datum moet voor eind datum liggen!")
+            st.stop()
+        
+        # Filter de data op basis van selecties
+        df_filtered = df_gps.copy()
+        
+        # Datum filter
+        df_filtered = df_filtered[
+            (df_filtered['datum'].dt.date >= start_date) & 
+            (df_filtered['datum'].dt.date <= end_date)
+        ]
+        
+        # Speler filter
+        if speler_filter != "Alle":
+            df_filtered = df_filtered[df_filtered['speler'] == speler_filter]
+        
+        # Toon info over gefilterde data
+        st.info(f"📊 **{len(df_filtered)} GPS sessies** gevonden van **{start_date.strftime('%d-%m-%Y')}** tot **{end_date.strftime('%d-%m-%Y')}**"
+                + (f" voor **{speler_filter}**" if speler_filter != "Alle" else f" voor **{df_filtered['speler'].nunique()} spelers**"))
+        
+        # Training Type overzicht
+        st.markdown("#### 📊 Training Types Overzicht")
+        training_types = df_filtered['training_type'].value_counts()
+        
+        col_info1, col_info2 = st.columns(2)
+        with col_info1:
+            st.write("**Training Types:**")
+            for t_type, count in training_types.items():
+                st.write(f"• {t_type}: {count} sessie(s)")
+        
+        with col_info2:
+            if len(training_types) > 1:
+                fig_types = px.pie(values=training_types.values, names=training_types.index,
+                                 title="Verdeling Training Types")
+                st.plotly_chart(fig_types, use_container_width=True)
+        
+        st.divider()
+
+        # Metrics
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            avg_distance = df_filtered['totale_afstand'].mean()
+            st.metric("Gemiddelde Afstand", f"{avg_distance:.0f}m")
+        
+        with col2:
+            avg_hi_distance = df_filtered['hoge_intensiteit_afstand'].mean()
+            st.metric("Gem. Hoge Intensiteit", f"{avg_hi_distance:.0f}m")
+        
+        with col3:
+            max_speed = df_filtered['max_snelheid'].max()
+            st.metric("Hoogste Snelheid", f"{max_speed:.1f} km/h")
+        
+        with col4:
+            avg_sprints = df_filtered['aantal_sprints'].mean()
+            st.metric("Gem. Aantal Sprints", f"{avg_sprints:.0f}")
+        
+        # Visualisaties
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Afstand trend
+            fig_distance = px.line(df_filtered, x='datum', y='totale_afstand',
+                                 color='speler', title="Totale Afstand Trend")
+            st.plotly_chart(fig_distance, use_container_width=True)
+        
+        with col2:
+            # Snelheid vs Afstand scatter
+            fig_scatter = px.scatter(df_filtered, x='totale_afstand', y='max_snelheid',
+                                   color='speler', size='player_load',
+                                   title="Snelheid vs Afstand")
+            st.plotly_chart(fig_scatter, use_container_width=True)
+        
+        # Data tabel met training informatie
+        st.markdown("#### 📋 GPS Data Overzicht")
+        
+        # Selecteer relevante kolommen voor weergave
+        display_columns = ['datum', 'speler', 'totale_afstand', 'hoge_intensiteit_afstand', 
+                         'max_snelheid', 'aantal_sprints', 'training_type', 'training_opmerkingen']
+        
+        display_df = df_filtered[display_columns].copy()
+        display_df['datum'] = display_df['datum'].dt.strftime('%d-%m-%Y')
+        display_df = display_df.rename(columns={
+            'datum': 'Datum',
+            'speler': 'Speler', 
+            'totale_afstand': 'Totale Afstand (m)',
+            'hoge_intensiteit_afstand': 'High Speed Running (m)',
+            'max_snelheid': 'Max Snelheid (km/h)',
+            'aantal_sprints': 'Sprints',
+            'training_type': 'Training Type',
+            'training_opmerkingen': 'Opmerkingen'
+        })
+        
+        st.dataframe(display_df.sort_values('Datum', ascending=False), use_container_width=True, hide_index=True)
+        
+        # Trainingsduur aanpassen sectie
+        st.markdown("---")
+        st.markdown("#### ⏱️ Trainingsduur Aanpassen")
+        st.info("💡 **Tip**: Pas de werkelijke trainingsduur aan voor nauwkeurige load/minute berekeningen in de Predictive Analytics.")
+        
+        # Selecteer training om duur aan te passen
+        if not df_filtered.empty:
+            # Groepeer per datum/training voor overzicht
+            training_options = []
+            
+            # Check welke kolom voor duur beschikbaar is
+            duration_col = None
+            if 'session_duur_minuten' in df_filtered.columns:
+                duration_col = 'session_duur_minuten'
+            elif 'Duur_Minuten' in df_filtered.columns:
+                duration_col = 'Duur_Minuten'
+            elif 'duur_minuten' in df_filtered.columns:
+                duration_col = 'duur_minuten'
+            
+            if duration_col:
+                df_grouped = df_filtered.groupby(['datum', 'training_id']).agg({
+                    duration_col: 'first',
+                    'speler': 'count',
+                    'totale_afstand': 'mean'
+                }).reset_index()
+            else:
+                # Fallback - gebruik standaard 90 minuten
+                df_grouped = df_filtered.groupby(['datum', 'training_id']).agg({
+                    'speler': 'count',
+                    'totale_afstand': 'mean'
+                }).reset_index()
+                df_grouped[duration_col or 'session_duur_minuten'] = 90
+            
+            for _, row in df_grouped.iterrows():
+                datum_str = row['datum'].strftime('%d-%m-%Y')
+                current_duration = row[duration_col or 'session_duur_minuten'] if duration_col else 90
+                training_options.append({
+                    'label': f"{datum_str} - Training ID {row['training_id']} ({row['speler']} spelers, {current_duration} min)",
+                    'training_id': row['training_id'],
+                    'datum': row['datum'],
+                    'current_duration': current_duration,
+                    'player_count': row['speler']
+                })
+            
+            if training_options:
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    selected_option = st.selectbox(
+                        "🏃 Selecteer Training om Duur Aan te Passen",
+                        options=range(len(training_options)),
+                        format_func=lambda x: training_options[x]['label']
+                    )
+                    
+                    selected_training = training_options[selected_option]
+                    
+                    # Input voor nieuwe duur
+                    new_duration = st.number_input(
+                        "⏱️ Nieuwe Trainingsduur (minuten)",
+                        min_value=15,
+                        max_value=180,
+                        value=int(selected_training['current_duration']),
+                        step=5,
+                        help="Voer de werkelijke duur van de training in"
+                    )
+                    
+                    # Toon wijziging
+                    duration_change = new_duration - selected_training['current_duration']
+                    if duration_change != 0:
+                        st.write(f"**Wijziging**: {duration_change:+d} minuten")
+                
+                with col2:
+                    st.write("**Training Info:**")
+                    st.write(f"📅 **Datum**: {selected_training['datum'].strftime('%d-%m-%Y')}")
+                    st.write(f"👥 **Spelers**: {selected_training['player_count']}")
+                    st.write(f"⏱️ **Huidig**: {selected_training['current_duration']} min")
+                    st.write(f"⏱️ **Nieuw**: {new_duration} min")
+                
+                # Update knop
+                if st.button("💾 Trainingsduur Bijwerken", type="primary"):
+                    if new_duration != selected_training['current_duration']:
+                        # Update alle GPS records voor deze training
+                        execute_db_query("""
+                            UPDATE gps_data 
+                            SET session_duur_minuten = ?
+                            WHERE training_id = ? AND datum = ?
+                        """, (new_duration, selected_training['training_id'], selected_training['datum']))
+                        
+                        # Ook heart rate data updaten als die bestaat
+                        execute_db_query("""
+                            UPDATE heart_rate_data 
+                            SET session_duur_minuten = ?
+                            WHERE training_id = ? AND datum = ?
+                        """, (new_duration, selected_training['training_id'], selected_training['datum']))
+                        
+                        st.success(f"✅ Trainingsduur bijgewerkt naar {new_duration} minuten voor alle {selected_training['player_count']} spelers!")
+                        st.info("🔄 **Let op**: Ga naar Predictive Analytics om de nieuwe load/minute berekeningen te zien.")
+                        st.rerun()
+                    else:
+                        st.info("ℹ️ Geen wijziging - duur is hetzelfde gebleven.")
+        else:
+            st.info("📭 Geen GPS data gevonden voor geselecteerde filters.")
+    
+    else:
+        st.info("📭 Nog geen GPS data beschikbaar. Import eerst GPS data via de Import tab.")
+
+with tab3:
+    st.markdown("### 🎯 RPE Data")
+    
+    # RPE Data invoer
+    st.markdown("#### ➕ RPE Data Invoer")
+    
+    # Haal beschikbare spelers op - fix for Supabase
+    available_spelers = []
+    
+    # Get players from spelers_profiel (main player table) 
+    try:
+        spelers_df = safe_fetchdf("SELECT naam FROM spelers_profiel WHERE status = 'Actief'")
+        if not spelers_df.empty:
+            available_spelers.extend(spelers_df['naam'].unique().tolist())
+    except Exception as e:
+        st.warning(f"Could not load players from spelers_profiel: {e}")
+    
+    # Also get players who already have GPS data
+    try:
+        gps_spelers_df = safe_fetchdf("SELECT speler FROM gps_data")
+        if not gps_spelers_df.empty:
+            for speler in gps_spelers_df['speler'].unique().tolist():
+                if speler not in available_spelers:
+                    available_spelers.append(speler)
+    except Exception as e:
+        st.warning(f"Could not load GPS players: {e}")
+    
+    # Also get players from thirty_fifteen_results
+    try:
+        test_spelers_df = safe_fetchdf("SELECT Speler FROM thirty_fifteen_results")
+        if not test_spelers_df.empty:
+            for speler in test_spelers_df['Speler'].unique().tolist():
+                if speler not in available_spelers:
+                    available_spelers.append(speler)
+    except Exception as e:
+        st.warning(f"Could not load test players: {e}")
+    
+    if available_spelers:
+        speler_names = sorted(available_spelers)
+        
+        # RPE Input - Selecties BUITEN form voor real-time updates
+        st.subheader("🎯 RPE Data Invoer")
+        
+        col_select1, col_select2 = st.columns(2)
+        
+        with col_select1:
+            selected_speler = st.selectbox("👤 Selecteer Speler", speler_names, key="rpe_speler")
+            rpe_datum = st.date_input("📅 Datum", value=datetime.now().date(), key="rpe_datum")
+        
+        with col_select2:
+            # Training selectie (laatste 3 dagen + komende 3 dagen)
+            date_range_start = rpe_datum - timedelta(days=3)
+            date_range_end = rpe_datum + timedelta(days=3)
+            
+            # Fixed: Use safe_fetchdf for Supabase compatibility - removed COALESCE
+            try:
+                available_trainings_df = safe_fetchdf(f"""
+                    SELECT training_id, datum, type, omschrijving, geplande_duur_minuten
+                    FROM trainings_calendar 
+                    WHERE datum >= '{date_range_start}' AND datum <= '{date_range_end}'
+                    ORDER BY datum DESC, training_id
+                """)
+                available_trainings = [tuple(row) for row in available_trainings_df.values] if not available_trainings_df.empty else []
+            except Exception as e:
+                st.error(f"Error loading trainings: {e}")
+                available_trainings = []
+            
+            training_options = ["Geen koppeling"]
+            training_map = {}
+            training_duration_map = {"Geen koppeling": 90}  # Default duur
+            
+            if available_trainings:
+                for training in available_trainings:
+                    training_id, datum, t_type, omschrijving, geplande_duur = training
+                    # Handle default duration in Python instead of SQL COALESCE
+                    duur = geplande_duur if geplande_duur is not None else 90
+                    # Format datum voor betere leesbaarheid
+                    datum_obj = pd.to_datetime(datum).date()
+                    datum_str = datum_obj.strftime('%d-%m-%Y')
+                    
+                    # Dag indicator toevoegen
+                    days_diff = (datum_obj - rpe_datum).days
+                    if days_diff == 0:
+                        day_indicator = "📅 Vandaag"
+                    elif days_diff == -1:
+                        day_indicator = "📅 Gisteren"
+                    elif days_diff == 1:
+                        day_indicator = "📅 Morgen"
+                    elif days_diff < 0:
+                        day_indicator = f"📅 {abs(days_diff)} dagen geleden"
+                    else:
+                        day_indicator = f"📅 Over {days_diff} dagen"
+                    
+                    display_text = f"{datum_str} - {t_type} ({duur}min) - {day_indicator}"
+                    if omschrijving:
+                        display_text += f" - {omschrijving[:15]}..." if len(omschrijving) > 15 else f" - {omschrijving}"
+                    training_options.append(display_text)
+                    training_map[display_text] = training_id
+                    training_duration_map[display_text] = duur
+            
+            selected_training_display = st.selectbox("🏃 Training Koppeling", training_options,
+                                                    help=f"Trainingen van {date_range_start.strftime('%d-%m')} tot {date_range_end.strftime('%d-%m')} (3 dagen voor/na geselecteerde datum)",
+                                                    key="rpe_training")
+            selected_training_id = training_map.get(selected_training_display, None)
+            
+            # Toon aantal beschikbare trainingen
+            if len(available_trainings) > 0:
+                st.caption(f"📊 {len(available_trainings)} trainingen beschikbaar in periode {date_range_start.strftime('%d-%m')} - {date_range_end.strftime('%d-%m')}")
+        
+        # Haal automatisch de duur op uit de geselecteerde training (NU buiten form!)
+        auto_duration = training_duration_map.get(selected_training_display, 90)
+        
+        # Haal training datum op voor weergave
+        training_datum = None
+        if selected_training_id:
+            try:
+                training_details_df = safe_fetchdf(f"SELECT datum FROM trainings_calendar WHERE training_id = {selected_training_id}")
+                if not training_details_df.empty:
+                    training_datum = pd.to_datetime(training_details_df['datum'].iloc[0]).date()
+            except Exception as e:
+                st.error(f"Error loading training details: {e}")
+        
+        # Toon training info en datum die gebruikt zal worden
+        if selected_training_display != "Geen koppeling" and training_datum:
+            st.success(f"📅 **RPE wordt opgeslagen voor training datum**: {training_datum.strftime('%d-%m-%Y')} ({selected_training_display.split(' - ')[1].split(' (')[0]})")
+            if training_datum != rpe_datum:
+                st.warning(f"⚠️ **Let op**: De ingestelde datum ({rpe_datum.strftime('%d-%m-%Y')}) wordt genegeerd. RPE wordt opgeslagen voor de training datum: **{training_datum.strftime('%d-%m-%Y')}**")
+        else:
+            st.info(f"ℹ️ Geen training geselecteerd - RPE wordt opgeslagen voor ingevoerde datum {rpe_datum.strftime('%d-%m-%Y')}")
+        # RPE Form met automatische waarden
+        with st.form("rpe_input"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                
+                # RPE Core
+                rpe_score = st.slider("🎯 RPE Score (1-10)", 1, 10, 5, 
+                                    help="Rate of Perceived Exertion: 1=Zeer Licht, 10=Maximaal")
+                
+                # Trainingsduur - toon automatisch ingeladen waarde
+                st.metric("⏱️ Trainingsduur", f"{auto_duration} minuten", help="Automatisch ingeladen uit geselecteerde training")
+                
+                # Gebruik de automatische duur voor berekeningen
+                session_duur = auto_duration
+                
+                # Toon of de duur automatisch is ingeladen
+                if selected_training_display != "Geen koppeling":
+                    if auto_duration != 90:
+                        st.info(f"🔗 **Automatisch ingeladen**: {auto_duration} min uit trainingskalender")
+                    else:
+                        st.info(f"🔗 **Gekoppeld aan training** (standaard duur: 90 min)")
+                
+                rpe_category, rpe_color = get_rpe_category(rpe_score)
+                st.markdown(f"**Categorie:** <span style='color: {rpe_color}'>{rpe_category}</span>", 
+                          unsafe_allow_html=True)
+            
+            # Alleen RPE invoer - geen extra welzijn metrics
+            st.write("")  # Ruimte voor symmetrie
+            
+            opmerkingen = st.text_area("💭 Opmerkingen", placeholder="Eventuele extra opmerkingen...")
+            
+            # Session load berekening (real-time update)
+            session_load = rpe_score * session_duur
+            
+            col_info1, col_info2 = st.columns(2)
+            with col_info1:
+                st.info(f"📊 Berekende Session Load: **{session_load:.0f}** (RPE {rpe_score} × {session_duur}min)")
+            with col_info2:
+                st.info(f"🎯 RPE Categorie: **{rpe_category}**")
+            
+            if st.form_submit_button("💾 RPE Data Opslaan", use_container_width=True):
+                # Validatie: Waarschuwing als geen training gekoppeld
+                if selected_training_display == "Geen koppeling":
+                    st.warning("⚠️ **Let op**: RPE wordt opgeslagen zonder koppeling aan een specifieke training.")
+                    st.info("💡 **Aanbeveling**: Voor betere analyses, ga terug en selecteer een training uit de lijst.")
+                try:
+                    # Haal training datum op binnen form scope
+                    actual_training_datum = None
+                    if selected_training_id:
+                        try:
+                            training_details_df = safe_fetchdf(f"SELECT datum FROM trainings_calendar WHERE training_id = {selected_training_id}")
+                            if not training_details_df.empty:
+                                actual_training_datum = pd.to_datetime(training_details_df['datum'].iloc[0]).date()
+                        except Exception as e:
+                            st.error(f"Error loading training datum: {e}")
+                    
+                    # Gebruik altijd de training datum wanneer RPE gekoppeld is aan een training
+                    rpe_save_datum = actual_training_datum if selected_training_id else rpe_datum
+                    
+                    # Debug info om te controleren welke datum gebruikt wordt
+                    if actual_training_datum:
+                        st.info(f"🔍 **Debug**: Gebruikt training datum {actual_training_datum.strftime('%d-%m-%Y')} (training_id: {selected_training_id})")
+                    else:
+                        st.info(f"🔍 **Debug**: Gebruikt ingevoerde datum {rpe_datum.strftime('%d-%m-%Y')} (geen training)")
+                    
+                    # Fixed: Use Supabase client for insert
+                    from supabase_config import get_supabase_client
+                    client = get_supabase_client()
+                    
+                    # Get next RPE ID
+                    existing_df = safe_fetchdf("SELECT MAX(rpe_id) as max_id FROM rpe_data")
+                    next_id = 1 if existing_df.empty or existing_df['max_id'].iloc[0] is None else existing_df['max_id'].iloc[0] + 1
+                    
+                    # Insert RPE data
+                    result = client.table('rpe_data').insert({
+                        'rpe_id': next_id,
+                        'speler': selected_speler,
+                        'datum': str(rpe_save_datum),
+                        'training_id': selected_training_id,
+                        'rpe_score': rpe_score,
+                        'rpe_categorie': rpe_category,
+                        'opmerkingen': opmerkingen,
+                        'session_load': session_load,
+                        'slaap_kwaliteit': 0,  # Default values for other fields
+                        'energie_voor_training': 0,
+                        'energie_na_training': 0,
+                        'spierpijn_voor': 0,
+                        'spierpijn_na': 0,
+                        'algemeen_welzijn': 0,
+                        'stress_level': 0,
+                        'motivatie': 0
+                    }).execute()
+                    
+                    if result.data:
+                        # Feedback over wat er opgeslagen werd
+                        if selected_training_id:
+                            training_info = selected_training_display.split(" - ")[1].split(" (")[0] if " - " in selected_training_display else "Onbekend"
+                            save_message = f"🔗 Gekoppeld aan training '{training_info}' van {rpe_save_datum.strftime('%d-%m-%Y')}"
+                        else:
+                            save_message = f"📅 Opgeslagen voor datum {rpe_save_datum.strftime('%d-%m-%Y')} zonder training koppeling"
+                        
+                        st.success(f"✅ RPE data opgeslagen voor {selected_speler}!\n{save_message}")
+                        st.rerun()
+                    else:
+                        st.error("❌ Fout bij opslaan RPE data")
+                except Exception as e:
+                    st.error(f"❌ Fout bij opslaan: {str(e)}")
+    
+    else:
+        st.warning("⚠️ Geen actieve spelers gevonden. Voeg eerst spelers toe.")
+    
+    st.divider()
+    
+    # RPE Data overzicht
+    st.markdown("#### 📊 RPE Overzicht (Laatste 14 dagen)")
+    
+    # Fixed RPE data loading using safe_fetchdf (no date filter initially)
+    try:
+        rpe_df = safe_fetchdf("SELECT * FROM rpe_data ORDER BY datum DESC, speler")
+        
+        if not rpe_df.empty:
+            # Convert date column and apply filter after loading
+            rpe_df['datum'] = pd.to_datetime(rpe_df['datum'])
+            filter_date = datetime.now().date() - timedelta(days=14)
+            rpe_df = rpe_df[rpe_df['datum'].dt.date >= filter_date]
+            
+            if not rpe_df.empty:
+                # Convert numeric columns from strings (fix Supabase string format)
+                numeric_columns = ['rpe_score', 'session_load', 'slaap_kwaliteit', 'energie_voor_training', 
+                                 'energie_na_training', 'spierpijn_voor', 'spierpijn_na', 'algemeen_welzijn', 
+                                 'stress_level', 'motivatie']
+                
+                for col in numeric_columns:
+                    if col in rpe_df.columns:
+                        rpe_df[col] = pd.to_numeric(rpe_df[col], errors='coerce').fillna(0)
+                
+                # Add default training_type column
+                rpe_df['training_type'] = 'Geen koppeling'
+                
+                # Select only needed columns and convert to tuples
+                columns_needed = ['speler', 'datum', 'rpe_score', 'rpe_categorie', 'session_load', 'training_type', 'opmerkingen']
+                rpe_data = [tuple(row[col] if col in rpe_df.columns else 'Geen koppeling' for col in columns_needed) 
+                           for _, row in rpe_df.iterrows()]
+            else:
+                rpe_data = []
+        else:
+            rpe_data = []
+    except Exception as e:
+        st.error(f"Error loading RPE data: {e}")
+        rpe_data = []
+    
+    if rpe_data:
+        df_rpe = pd.DataFrame(rpe_data, columns=[
+            'speler', 'datum', 'rpe_score', 'rpe_categorie', 'session_load',
+            'training_type', 'opmerkingen'
+        ])
+        df_rpe['datum'] = pd.to_datetime(df_rpe['datum'])
+        
+        # RPE Metrics
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            avg_rpe = df_rpe['rpe_score'].mean()
+            st.metric("Gem. RPE", f"{avg_rpe:.1f}")
+        
+        with col2:
+            avg_load = df_rpe['session_load'].mean()
+            st.metric("Gem. Session Load", f"{avg_load:.0f}")
+        
+        # RPE Visualisaties
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # RPE Trend
+            fig_rpe = px.line(df_rpe, x='datum', y='rpe_score', color='speler',
+                            title="RPE Score Trend")
+            fig_rpe.update_layout(yaxis=dict(range=[0, 11]))
+            st.plotly_chart(fig_rpe, use_container_width=True)
+        
+        with col2:
+            # RPE Distributie
+            rpe_dist = df_rpe['rpe_categorie'].value_counts()
+            fig_dist = px.pie(values=rpe_dist.values, names=rpe_dist.index,
+                            title="RPE Categorie Verdeling")
+            st.plotly_chart(fig_dist, use_container_width=True)
+        
+        # Session Load vs RPE Score
+        if len(df_rpe) > 1:
+            fig_correlation = px.scatter(df_rpe, x='session_load', y='rpe_score',
+                                       color='speler',
+                                       title="Session Load vs RPE Score",
+                                       hover_data=['training_type'])
+            st.plotly_chart(fig_correlation, use_container_width=True)
+        
+        # RPE Data tabel
+        st.markdown("#### 📋 RPE Data Details")
+        display_df = df_rpe.copy()
+        display_df['datum'] = display_df['datum'].dt.strftime('%d-%m-%Y')
+        display_df = display_df[['datum', 'speler', 'rpe_score', 'rpe_categorie', 
+                               'session_load', 'training_type', 'opmerkingen']]
+        display_df = display_df.rename(columns={
+            'datum': 'Datum', 'speler': 'Speler', 'rpe_score': 'RPE Score',
+            'rpe_categorie': 'Categorie', 'session_load': 'Session Load',
+            'training_type': 'Training Type', 'opmerkingen': 'Opmerkingen'
+        })
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+        # RPE Data aanpassen sectie
+        st.markdown("---")
+        st.markdown("#### ✏️ RPE Data Aanpassen")
+        st.info("💡 **Tip**: Pas bestaande RPE data aan om de trainingsduur of RPE score te corrigeren.")
+        
+        # Selecteer RPE entry om aan te passen
+        if not df_rpe.empty:
+            rpe_options = []
+            for _, row in df_rpe.iterrows():
+                datum_str = row['datum'].strftime('%d-%m-%Y')
+                rpe_options.append({
+                    'label': f"{datum_str} - {row['speler']} (RPE: {row['rpe_score']}, Load: {row['session_load']:.0f})",
+                    'speler': row['speler'],
+                    'datum': row['datum'],
+                    'current_rpe': row['rpe_score'],
+                    'current_load': row['session_load'],
+                    'current_duration': int(row['session_load'] / row['rpe_score']) if row['rpe_score'] > 0 else 90,
+                    'opmerkingen': row['opmerkingen']
+                })
+            
+            if rpe_options:
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    selected_rpe_idx = st.selectbox(
+                        "📝 Selecteer RPE Entry om Aan te Passen",
+                        options=range(len(rpe_options)),
+                        format_func=lambda x: rpe_options[x]['label']
+                    )
+                    
+                    selected_rpe = rpe_options[selected_rpe_idx]
+                    
+                    # Inputs voor aanpassing
+                    new_rpe_score = st.slider("🎯 Nieuwe RPE Score", 1, 10, 
+                                            value=int(selected_rpe['current_rpe']),
+                                            key="edit_rpe_score")
+                    
+                    new_duration = st.number_input("⏱️ Nieuwe Trainingsduur (minuten)",
+                                                 min_value=15, max_value=180, 
+                                                 value=selected_rpe['current_duration'],
+                                                 step=5, key="edit_duration")
+                    
+                    new_opmerkingen = st.text_area("💭 Opmerkingen", 
+                                                  value=selected_rpe['opmerkingen'] or "",
+                                                  key="edit_opmerkingen")
+                    
+                    # Nieuwe session load berekenen
+                    new_session_load = new_rpe_score * new_duration
+                    
+                    # Toon wijzigingen
+                    rpe_change = new_rpe_score - selected_rpe['current_rpe']
+                    duration_change = new_duration - selected_rpe['current_duration']
+                    load_change = new_session_load - selected_rpe['current_load']
+                    
+                    if rpe_change != 0 or duration_change != 0:
+                        st.write("**📊 Wijzigingen:**")
+                        if rpe_change != 0:
+                            st.write(f"• RPE: {rpe_change:+.0f} (was {selected_rpe['current_rpe']}, wordt {new_rpe_score})")
+                        if duration_change != 0:
+                            st.write(f"• Duur: {duration_change:+.0f} min (was {selected_rpe['current_duration']}, wordt {new_duration})")
+                        if load_change != 0:
+                            st.write(f"• Session Load: {load_change:+.0f} (was {selected_rpe['current_load']:.0f}, wordt {new_session_load})")
+                
+                with col2:
+                    st.write("**Huidige Info:**")
+                    st.write(f"📅 **Datum**: {selected_rpe['datum'].strftime('%d-%m-%Y')}")
+                    st.write(f"👤 **Speler**: {selected_rpe['speler']}")
+                    st.write(f"🎯 **Huidig RPE**: {selected_rpe['current_rpe']}")
+                    st.write(f"⏱️ **Huidige Duur**: {selected_rpe['current_duration']} min")
+                    st.write(f"📊 **Huidige Load**: {selected_rpe['current_load']:.0f}")
+                
+                # Actie knoppen
+                col_update, col_delete = st.columns([1, 1])
+                
+                with col_update:
+                    if st.button("💾 RPE Data Bijwerken", type="primary", key="update_rpe"):
+                        if rpe_change != 0 or duration_change != 0 or new_opmerkingen != (selected_rpe['opmerkingen'] or ""):
+                            try:
+                                # Update RPE record
+                                new_category, _ = get_rpe_category(new_rpe_score)
+                                
+                                execute_db_query("""
+                                    UPDATE rpe_data 
+                                    SET rpe_score = ?, rpe_categorie = ?, session_load = ?, opmerkingen = ?
+                                    WHERE speler = ? AND datum = ?
+                                """, (new_rpe_score, new_category, new_session_load, new_opmerkingen,
+                                      selected_rpe['speler'], selected_rpe['datum'].date()))
+                                
+                                st.success(f"✅ RPE data bijgewerkt voor {selected_rpe['speler']} op {selected_rpe['datum'].strftime('%d-%m-%Y')}!")
+                                st.rerun()
+                                
+                            except Exception as e:
+                                st.error(f"❌ Fout bij bijwerken: {str(e)}")
+                        else:
+                            st.info("ℹ️ Geen wijzigingen gedetecteerd.")
+                
+                with col_delete:
+                    if st.button("🗑️ RPE Data Verwijderen", key="delete_rpe"):
+                        try:
+                            execute_db_query("""
+                                DELETE FROM rpe_data 
+                                WHERE speler = ? AND datum = ?
+                            """, (selected_rpe['speler'], selected_rpe['datum'].date()))
+                            
+                            st.success(f"✅ RPE data verwijderd voor {selected_rpe['speler']} op {selected_rpe['datum'].strftime('%d-%m-%Y')}!")
+                            st.rerun()
+                            
+                        except Exception as e:
+                            st.error(f"❌ Fout bij verwijderen: {str(e)}")
+                
+                # Bevestiging voor delete
+                st.warning("⚠️ **Let op**: Verwijderen kan niet ongedaan gemaakt worden!")
+    
+    else:
+        st.info("📭 Nog geen RPE data beschikbaar. Voer hierboven RPE data in.")
+
+# Database cleanup
+# Safe database connection cleanup
+# Database cleanup handled by Supabase helpers

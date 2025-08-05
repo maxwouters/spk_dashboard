@@ -1,0 +1,490 @@
+import streamlit as st
+import pandas as pd
+import duckdb
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+from datetime import datetime, timedelta, date
+import numpy as np
+
+from db_config import get_database_connection
+from database_helpers import safe_fetchdf
+st.set_page_config(page_title="Team Overzicht - SPK Dashboard", layout="wide")
+
+# Custom CSS styling
+st.markdown("""
+<style>
+    .main-header {
+        background: linear-gradient(90deg, #2E86AB 0%, #A23B72 100%);
+        padding: 1rem;
+        border-radius: 10px;
+        margin-bottom: 2rem;
+        color: white;
+        text-align: center;
+    }
+    
+    .info-card {
+        background: linear-gradient(135deg, #FAFCFF 0%, #E8F4FD 100%);
+        padding: 1.5rem;
+        border-radius: 10px;
+        border-left: 4px solid #2E86AB;
+        margin: 1rem 0;
+        box-shadow: 0 2px 4px rgba(46, 134, 171, 0.1);
+    }
+    
+    .section-card {
+        background: white;
+        padding: 1.2rem;
+        border-radius: 8px;
+        border: 1px solid #E8F4FD;
+        margin: 0.8rem 0;
+        box-shadow: 0 2px 4px rgba(46, 134, 171, 0.05);
+    }
+    
+    .accent-blue { color: #2E86AB; font-weight: bold; }
+    .accent-purple { color: #A23B72; font-weight: bold; }
+    .accent-orange { color: #F18F01; font-weight: bold; }
+    .accent-green { color: #2E8B57; font-weight: bold; }
+    .accent-red { color: #DC143C; font-weight: bold; }
+    
+    .team-stats {
+        background: linear-gradient(135deg, #1E3A8A 0%, #3B82F6 100%);
+        color: white;
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 1rem 0;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="main-header"><h1>👥 Team Overzicht Compleet</h1></div>', unsafe_allow_html=True)
+
+# Database connectie
+con = get_database_connection()
+
+def get_team_summary_stats():
+    """Haal team samenvatting statistieken op"""
+    
+    # Aantal spelers
+    total_players = con.execute("SELECT COUNT(*) FROM spelers_profiel WHERE status = 'Actief'").fetchone()[0]
+    
+    # Gemiddelde leeftijd
+    avg_age = con.execute("SELECT AVG(leeftijd) FROM spelers_profiel WHERE leeftijd IS NOT NULL AND status = 'Actief'").fetchone()[0]
+    
+    # Laatste training datum
+    last_training = con.execute("SELECT MAX(datum) FROM gps_data").fetchone()[0]
+    
+    # Gemiddelde RPE laatste week
+    week_ago = datetime.now() - timedelta(days=7)
+    avg_rpe = con.execute("""
+        SELECT AVG(rpe_score) FROM rpe_data 
+        WHERE datum >= ? AND rpe_score IS NOT NULL
+    """, (week_ago.date(),)).fetchone()[0]
+    
+    # Aantal trainingen laatste week
+    trainings_count = con.execute("""
+        SELECT COUNT(DISTINCT datum) FROM gps_data 
+        WHERE datum >= ?
+    """, (week_ago.date(),)).fetchone()[0]
+    
+    return {
+        'total_players': total_players or 0,
+        'avg_age': round(avg_age, 1) if avg_age else 0,
+        'last_training': last_training,
+        'avg_rpe': round(avg_rpe, 1) if avg_rpe else 0,
+        'trainings_week': trainings_count or 0
+    }
+
+def get_player_comprehensive_data():
+    """Haal uitgebreide speler data op voor team overzicht"""
+    
+    # Basis speler informatie
+    players_query = """
+        SELECT 
+            sp.naam,
+            sp.leeftijd,
+            sp.positie,
+            sp.rugnummer,
+            sp.status,
+            sp.gewicht
+        FROM spelers_profiel sp
+        WHERE sp.status = 'Actief'
+        ORDER BY sp.rugnummer ASC, sp.naam ASC
+    """
+    
+    players_df = safe_fetchdf(con, players_query)
+    
+    if len(players_df) == 0:
+        return pd.DataFrame()
+    
+    # 30-15 fitness data
+    fitness_query = """
+        SELECT 
+            Speler as naam,
+            MAS,
+            VO2MAX,
+            PeakVelocity,
+            ROW_NUMBER() OVER (PARTITION BY Speler ORDER BY Maand DESC) as rn
+        FROM thirty_fifteen_results
+    """
+    fitness_df = safe_fetchdf(con, fitness_query)
+    fitness_df = fitness_df[fitness_df['rn'] == 1].drop('rn', axis=1)
+    
+    # Laatste 7 dagen RPE data
+    week_ago = datetime.now() - timedelta(days=7)
+    rpe_query = """
+        SELECT 
+            speler as naam,
+            AVG(rpe_score) as avg_rpe_7d,
+            AVG(slaap_kwaliteit) as avg_sleep_7d,
+            AVG(energie_voor_training) as avg_energy_7d,
+            AVG(stress_level) as avg_stress_7d,
+            COUNT(*) as rpe_sessions_7d
+        FROM rpe_data 
+        WHERE datum >= ?
+        GROUP BY speler
+    """, (week_ago.date(),)
+    rpe_df = safe_fetchdf(con, *rpe_query)
+    
+    # Laatste 7 dagen GPS data - gebruik alleen bevestigd bestaande kolommen
+    gps_query = """
+        SELECT 
+            speler as naam,
+            COUNT(*) as gps_sessions_7d,
+            AVG(hoge_intensiteit_afstand) as avg_hsr_7d,
+            AVG(zeer_hoge_intensiteit_afstand) as avg_zeer_hsr_7d
+        FROM gps_data 
+        WHERE datum >= ?
+        GROUP BY speler
+    """, (week_ago.date(),)
+    gps_df = safe_fetchdf(con, *gps_query)
+    
+    # Training attendance laatste 30 dagen
+    month_ago = datetime.now() - timedelta(days=30)
+    attendance_query = """
+        SELECT 
+            ta.speler as naam,
+            COUNT(*) as trainings_attended_30d,
+            (COUNT(*) * 100.0 / (SELECT COUNT(DISTINCT training_id) FROM training_attendance WHERE training_id IN (
+                SELECT training_id FROM trainings_calendar WHERE datum >= ?
+            ))) as attendance_percentage_30d
+        FROM training_attendance ta
+        JOIN trainings_calendar tc ON ta.training_id = tc.training_id
+        WHERE tc.datum >= ? AND ta.status = 'Aanwezig'
+        GROUP BY ta.speler
+    """, (month_ago.date(), month_ago.date())
+    attendance_df = safe_fetchdf(con, *attendance_query)
+    
+    # Blessure data (als beschikbaar)
+    injury_query = """
+        SELECT 
+            speler as naam,
+            blessure_type,
+            status as injury_status,
+            datum_blessure
+        FROM blessures 
+        WHERE status IN ('Actief', 'Herstel') 
+        ORDER BY datum_blessure DESC
+    """
+    try:
+        injury_df = safe_fetchdf(con, injury_query)
+        # Groepeer per speler (neem meest recente blessure)
+        if len(injury_df) > 0:
+            injury_df = injury_df.groupby('naam').first().reset_index()
+    except:
+        injury_df = pd.DataFrame(columns=['naam', 'blessure_type', 'injury_status'])
+    
+    # Merge alle data
+    result_df = players_df.copy()
+    result_df = result_df.merge(fitness_df, on='naam', how='left')
+    result_df = result_df.merge(rpe_df, on='naam', how='left')
+    result_df = result_df.merge(gps_df, on='naam', how='left')
+    result_df = result_df.merge(attendance_df, on='naam', how='left')
+    result_df = result_df.merge(injury_df, on='naam', how='left')
+    
+    # Bereken load status
+    result_df['load_status'] = 'Normaal'
+    result_df.loc[result_df['avg_rpe_7d'] >= 7, 'load_status'] = 'Hoog'
+    result_df.loc[result_df['avg_rpe_7d'] <= 4, 'load_status'] = 'Laag'
+    
+    # Overall status bepalen
+    result_df['overall_status'] = 'Actief'
+    result_df.loc[result_df['injury_status'].notna(), 'overall_status'] = 'Geblesseerd'
+    result_df.loc[result_df['load_status'] == 'Hoog', 'overall_status'] = 'Hoge Belasting'
+    
+    return result_df
+
+# Haal team data op
+team_stats = get_team_summary_stats()
+team_data = get_player_comprehensive_data()
+
+# Team Statistics Header
+st.markdown('<div class="team-stats">', unsafe_allow_html=True)
+col1, col2, col3, col4, col5 = st.columns(5)
+
+with col1:
+    st.metric("👥 Totaal Spelers", team_stats['total_players'])
+
+with col2:
+    st.metric("📅 Gem. Leeftijd", f"{team_stats['avg_age']} jaar")
+
+with col3:
+    st.metric("🏃‍♂️ Trainingen (7d)", team_stats['trainings_week'])
+
+with col4:
+    st.metric("⚡ Gem. RPE (7d)", team_stats['avg_rpe'])
+
+with col5:
+    last_training_str = team_stats['last_training'].strftime('%d/%m') if team_stats['last_training'] else 'Geen'
+    st.metric("📊 Laatste Training", last_training_str)
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+if len(team_data) == 0:
+    st.warning("⚠️ Geen actieve spelers gevonden. Zorg ervoor dat er spelers zijn toegevoegd in Spelersbeheer.")
+else:
+    
+    # Filter opties
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown("### <span class='accent-blue'>🔍 Filter Opties</span>", unsafe_allow_html=True)
+    
+    col_filter1, col_filter2, col_filter3, col_filter4 = st.columns(4)
+    
+    with col_filter1:
+        position_filter = st.selectbox("Positie", ["Alle Posities"] + sorted(team_data['positie'].dropna().unique().tolist()))
+    
+    with col_filter2:
+        status_filter = st.selectbox("Status", ["Alle Statussen"] + sorted(team_data['overall_status'].unique().tolist()))
+    
+    with col_filter3:
+        load_filter = st.selectbox("Belasting", ["Alle Belastingen"] + sorted(team_data['load_status'].unique().tolist()))
+    
+    with col_filter4:
+        sort_by = st.selectbox("Sorteer op", ["Rugnummer", "Naam", "MAS", "VO2MAX", "RPE (7d)", "Aanwezigheid"])
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Filter de data
+    filtered_data = team_data.copy()
+    
+    if position_filter != "Alle Posities":
+        filtered_data = filtered_data[filtered_data['positie'] == position_filter]
+    
+    if status_filter != "Alle Statussen":
+        filtered_data = filtered_data[filtered_data['overall_status'] == status_filter]
+    
+    if load_filter != "Alle Belastingen":
+        filtered_data = filtered_data[filtered_data['load_status'] == load_filter]
+    
+    # Sorteer de data
+    if sort_by == "Rugnummer":
+        filtered_data = filtered_data.sort_values('rugnummer', na_position='last')
+    elif sort_by == "Naam":
+        filtered_data = filtered_data.sort_values('naam')
+    elif sort_by == "MAS":
+        filtered_data = filtered_data.sort_values('MAS', ascending=False, na_position='last')
+    elif sort_by == "VO2MAX":
+        filtered_data = filtered_data.sort_values('VO2MAX', ascending=False, na_position='last')
+    elif sort_by == "RPE (7d)":
+        filtered_data = filtered_data.sort_values('avg_rpe_7d', ascending=False, na_position='last')
+    elif sort_by == "Aanwezigheid":
+        filtered_data = filtered_data.sort_values('attendance_percentage_30d', ascending=False, na_position='last')
+    
+    # Spelers Overzicht Grid
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown(f"### <span class='accent-purple'>👥 Spelers Overzicht ({len(filtered_data)} spelers)</span>", unsafe_allow_html=True)
+    
+    # Maak compacte display data
+    display_data = []
+    for idx, speler in filtered_data.iterrows():
+        
+        # Status emoji
+        if speler['overall_status'] == 'Geblesseerd':
+            status_emoji = "🩹"
+        elif speler['overall_status'] == 'Hoge Belasting':
+            status_emoji = "⚡"
+        else:
+            status_emoji = "✅"
+        
+        # Compact format
+        rugnummer = f"#{int(speler['rugnummer'])}" if pd.notna(speler['rugnummer']) else "#--"
+        naam = speler['naam']
+        positie = speler['positie'] if pd.notna(speler['positie']) else "N/A"
+        leeftijd = int(speler['leeftijd']) if pd.notna(speler['leeftijd']) else "N/A"
+        mas = f"{speler['MAS']:.1f}" if pd.notna(speler['MAS']) else "N/A"
+        vo2 = f"{speler['VO2MAX']:.0f}" if pd.notna(speler['VO2MAX']) else "N/A"
+        rpe = f"{speler['avg_rpe_7d']:.1f}" if pd.notna(speler['avg_rpe_7d']) else "N/A"
+        sessions = int(speler['gps_sessions_7d']) if pd.notna(speler['gps_sessions_7d']) else 0
+        hsr = f"{speler['avg_hsr_7d']:.0f}" if pd.notna(speler['avg_hsr_7d']) else "N/A"
+        attendance = f"{speler['attendance_percentage_30d']:.0f}%" if pd.notna(speler['attendance_percentage_30d']) else "N/A"
+        
+        # Wellness alerts
+        alerts = []
+        if pd.notna(speler['avg_sleep_7d']) and speler['avg_sleep_7d'] <= 6:
+            alerts.append("😴")
+        if pd.notna(speler['avg_stress_7d']) and speler['avg_stress_7d'] >= 7:
+            alerts.append("😰")
+        if pd.notna(speler['blessure_type']):
+            alerts.append("🩹")
+        alert_str = "".join(alerts) if alerts else ""
+        
+        display_data.append({
+            'Status': status_emoji,
+            'Nr': rugnummer,
+            'Naam': naam,
+            'Pos': positie,
+            'Leef': leeftijd,
+            'MAS': mas,
+            'VO2': vo2,
+            'RPE': rpe,
+            'Sess': sessions,
+            'HSR': hsr,
+            'Aanw': attendance,
+            'Alerts': alert_str
+        })
+    
+    # Compacte tabel weergave
+    if display_data:
+        df_display = pd.DataFrame(display_data)
+        
+        # Kleurcode de dataframe op basis van status
+        def highlight_status(row):
+            if row['Status'] == '🩹':
+                return ['background-color: #ffebee'] * len(row)
+            elif row['Status'] == '⚡':
+                return ['background-color: #fff3e0'] * len(row)
+            else:
+                return ['background-color: #f1f8e9'] * len(row)
+        
+        styled_df = df_display.style.apply(highlight_status, axis=1)
+        
+        st.dataframe(
+            styled_df,
+            use_container_width=True,
+            hide_index=True,
+            height=400,
+            column_config={
+                'Status': st.column_config.TextColumn('Status', width='small'),
+                'Nr': st.column_config.TextColumn('#', width='small'),
+                'Naam': st.column_config.TextColumn('Naam', width='medium'),
+                'Pos': st.column_config.TextColumn('Positie', width='small'),
+                'Leef': st.column_config.TextColumn('Jaar', width='small'),
+                'MAS': st.column_config.TextColumn('MAS', width='small'),
+                'VO2': st.column_config.TextColumn('VO2', width='small'),
+                'RPE': st.column_config.TextColumn('RPE', width='small'),
+                'Sess': st.column_config.NumberColumn('Sess', width='small'),
+                'HSR': st.column_config.TextColumn('HSR', width='small'),
+                'Aanw': st.column_config.TextColumn('Aanw%', width='small'),
+                'Alerts': st.column_config.TextColumn('⚠️', width='small')
+            }
+        )
+        
+        # Legenda
+        st.caption("**Status:** ✅ Actief | ⚡ Hoge Belasting | 🩹 Geblesseerd")
+        st.caption("**Alerts:** 😴 Slechte slaap | 😰 Hoge stress | 🩹 Blessure")
+        st.caption("**Afkortingen:** Pos=Positie, Leef=Leeftijd, Sess=Sessies (7d), HSR=High Speed Running (7d), Aanw=Aanwezigheid (30d)")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Team Analytics Dashboard
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown("### <span class='accent-green'>📊 Team Analytics</span>", unsafe_allow_html=True)
+    
+    # Bereken team statistieken
+    active_players = filtered_data[filtered_data['overall_status'] != 'Geblesseerd']
+    
+    if len(active_players) > 0:
+        col_chart1, col_chart2 = st.columns(2)
+        
+        with col_chart1:
+            # Fitness distributie (MAS)
+            mas_data = active_players.dropna(subset=['MAS'])
+            if len(mas_data) > 0:
+                fig_mas = px.histogram(
+                    mas_data, 
+                    x='MAS', 
+                    nbins=8,
+                    title='MAS Distributie (km/u)',
+                    color_discrete_sequence=['#2E86AB']
+                )
+                fig_mas.update_layout(height=300, showlegend=False)
+                st.plotly_chart(fig_mas, use_container_width=True)
+        
+        with col_chart2:
+            # RPE distributie (laatste 7 dagen)
+            rpe_data = active_players.dropna(subset=['avg_rpe_7d'])
+            if len(rpe_data) > 0:
+                fig_rpe = px.histogram(
+                    rpe_data, 
+                    x='avg_rpe_7d', 
+                    nbins=6,
+                    title='RPE Distributie (7 dagen gemiddeld)',
+                    color_discrete_sequence=['#A23B72']
+                )
+                fig_rpe.update_layout(height=300, showlegend=False)
+                st.plotly_chart(fig_rpe, use_container_width=True)
+        
+        # Positie analyse
+        col_pos1, col_pos2 = st.columns(2)
+        
+        with col_pos1:
+            pos_data = active_players['positie'].value_counts()
+            if len(pos_data) > 0:
+                fig_pos = px.pie(
+                    values=pos_data.values, 
+                    names=pos_data.index,
+                    title='Spelers per Positie'
+                )
+                fig_pos.update_layout(height=300)
+                st.plotly_chart(fig_pos, use_container_width=True)
+        
+        with col_pos2:
+            # Load status overzicht
+            load_data = active_players['load_status'].value_counts()
+            if len(load_data) > 0:
+                fig_load = px.pie(
+                    values=load_data.values, 
+                    names=load_data.index,
+                    title='Training Load Status',
+                    color_discrete_map={
+                        'Normaal': '#2E86AB',
+                        'Hoog': '#DC143C', 
+                        'Laag': '#2E8B57'
+                    }
+                )
+                fig_load.update_layout(height=300)
+                st.plotly_chart(fig_load, use_container_width=True)
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Export functionaliteit
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown("### <span class='accent-orange'>📥 Export Data</span>", unsafe_allow_html=True)
+    
+    # Maak export data
+    export_data = filtered_data.copy()
+    export_cols = [
+        'naam', 'leeftijd', 'positie', 'rugnummer', 'overall_status',
+        'MAS', 'VO2MAX', 'PeakVelocity', 'avg_rpe_7d', 
+        'avg_hsr_7d', 'avg_zeer_hsr_7d', 'gps_sessions_7d', 'attendance_percentage_30d'
+    ]
+    
+    export_data = export_data[export_cols].fillna('N/A')
+    
+    col_exp1, col_exp2 = st.columns(2)
+    
+    with col_exp1:
+        csv_data = export_data.to_csv(index=False)
+        st.download_button(
+            label="📊 Download Team Data CSV",
+            data=csv_data,
+            file_name=f"team_overzicht_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv"
+        )
+    
+    with col_exp2:
+        st.button("📊 Print Rapport", disabled=True, help="Functie in ontwikkeling")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+
+con.close()

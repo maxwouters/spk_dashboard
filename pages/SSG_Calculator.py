@@ -1,0 +1,767 @@
+import streamlit as st
+
+# Auto-expand sidebar for better UX with sidebar controls
+st.set_page_config(page_title="⚽ SSG Calculator - SPK Dashboard", layout="wide", initial_sidebar_state="expanded")
+
+# Supabase helpers (primary)
+try:
+    from supabase_helpers import (
+        get_table_data, 
+        get_thirty_fifteen_results, 
+        get_cached_player_list,
+        test_supabase_connection,
+        safe_fetchdf,
+        check_table_exists
+    )
+    SUPABASE_MODE = True
+except ImportError:
+    # Fallback to legacy
+    from db_config import get_database_connection
+    from database_helpers import check_table_exists, get_table_columns, add_column_if_not_exists, safe_fetchdf
+    SUPABASE_MODE = False
+
+# Database setup
+if SUPABASE_MODE:
+    st.info("🌐 Using Supabase database")
+    if not test_supabase_connection():
+        st.error("❌ Cannot connect to Supabase")
+        st.stop()
+    con = None  # Will use Supabase helpers
+else:
+    # Legacy mode
+    try:
+        con = get_database_connection()
+    except NameError:
+        st.error("❌ Database connection not available")
+        st.stop()
+import pandas as pd
+import matplotlib.pyplot as plt
+import math
+from PIL import Image
+import plotly.graph_objects as go
+import numpy as np
+
+# Font configuratie met fallback
+try:
+    from matplotlib.font_manager import FontProperties as fm
+    tstar_font = fm(fname='/Users/maximwouters/Downloads/t-star-pro-cufonfonts/TStarProHeavy.ttf')
+    trim_font = fm(fname='/Users/maximwouters/Downloads/Trim-Bold/Trim-Bold.otf')
+except:
+    tstar_font = None
+    trim_font = None
+
+
+# Database compatibility functions
+def execute_db_query(query, params=None):
+    """Execute query and return results compatible with both databases"""
+    if SUPABASE_MODE:
+        try:
+            df = safe_fetchdf(query, params or {})
+            if df.empty:
+                return []
+            # Convert DataFrame to list of tuples (like fetchall())
+            return [tuple(row) for row in df.values]
+        except Exception as e:
+            st.error(f"Query failed: {e}")
+            return []
+    else:
+        # Legacy mode
+        try:
+            if params:
+                return execute_db_query(query, params)
+            else:
+                return execute_db_query(query)
+        except Exception as e:
+            st.error(f"Legacy query failed: {e}")
+            return []
+
+def get_supabase_data(table_name, columns="*", where_conditions=None):
+    """Get data using Supabase helpers"""
+    if SUPABASE_MODE:
+        return get_table_data(table_name, columns, where_conditions)
+    else:
+        # Legacy fallback
+        query = f"SELECT {columns} FROM {table_name}"
+        if where_conditions:
+            conditions = [f"{k} = '{v}'" for k, v in where_conditions.items()]
+            query += f" WHERE {' AND '.join(conditions)}"
+        return safe_fetchdf(query)
+
+# Page config already set at top of file
+
+st.title('⚽ SSG Calculator')
+st.markdown("*Small-Sided Games Calculator voor Positiespel & Wedstrijdvormen*")
+
+# Presets voor veelgebruikte configuraties
+st.sidebar.markdown("## 🎯 Snelkeuze Presets")
+
+preset_configs = {
+    "🥅 11v11 Wedstrijdvorm": {"team1": 11, "team2": 11, "length": 105, "width": 68, "keepers": True},
+    "⚽ 7v7 Positiespel": {"team1": 7, "team2": 7, "length": 70, "width": 50, "keepers": False},
+    "🎯 4v4+2 Training": {"team1": 4, "team2": 4, "length": 40, "width": 30, "keepers": False},
+    "🔥 3v3 Intensief": {"team1": 3, "team2": 3, "length": 25, "width": 20, "keepers": False},
+    "📏 Aangepast": {"team1": 6, "team2": 6, "length": 50, "width": 35, "keepers": False}
+}
+
+selected_preset = st.sidebar.selectbox("Kies een preset:", list(preset_configs.keys()))
+
+# Hoofdfunctie keuze
+option = st.sidebar.selectbox('🔧 Bereken Functie', [
+    'Oppervlakte per Speler', 
+    'Veld Afmetingen berekenen',
+    'Vergelijk Configuraties'
+])
+
+if option == 'Oppervlakte per Speler':
+    st.header("📐 Bereken Oppervlakte per Speler")
+    
+    # Preset laden
+    preset = preset_configs[selected_preset]
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### ⚽ Spelers Configuratie")
+        team_1_players = st.number_input('Aantal spelers Team 1', 
+                                       min_value=1, max_value=15, 
+                                       value=preset["team1"], step=1)
+        team_2_players = st.number_input('Aantal spelers Team 2', 
+                                       min_value=1, max_value=15, 
+                                       value=preset["team2"], step=1)
+        
+        # Neutrale spelers optie
+        neutrale_spelers = st.number_input('Neutrale spelers (bijv. +2)', 
+                                         min_value=0, max_value=6, value=0)
+        
+        met_keepers = st.checkbox("Met Keepers", value=preset["keepers"])
+        
+    with col2:
+        st.markdown("### 📏 Veld Afmetingen")
+        pitch_length = st.number_input('Veld Lengte (m)', 
+                                     min_value=10, max_value=110, 
+                                     value=preset["length"], step=1)
+        pitch_width = st.number_input('Veld Breedte (m)', 
+                                    min_value=10, max_value=70, 
+                                    value=preset["width"], step=1)
+    
+    # Berekeningen
+    totaal_spelers = team_1_players + team_2_players + neutrale_spelers
+    pitch_area = pitch_length * pitch_width
+    area_per_player = round(pitch_area / totaal_spelers, 1)
+    
+    # Bepaal SSG grootte (Small/Medium/Large sided games)
+    def get_ssg_size(total_players):
+        if total_players <= 8:
+            return "🔸 Small Sided Game", "SSG"
+        elif total_players <= 14:
+            return "🔹 Medium Sided Game", "MSG"
+        else:
+            return "🔺 Large Sided Game", "LSG"
+    
+    ssg_category, ssg_abbrev = get_ssg_size(totaal_spelers)
+    
+    # Bepaal afstand categorie (klein/medium/groot)
+    def get_distance_category(area_per_player, with_keepers=False):
+        if with_keepers:
+            # Aangepaste ranges voor spellen met keepers
+            if area_per_player < 120:
+                return "📏 Klein", "Korte afstanden"
+            elif area_per_player < 280:
+                return "📐 Medium", "Gemiddelde afstanden"
+            else:
+                return "📊 Groot", "Lange afstanden"
+        else:
+            # Aangepaste ranges voor spellen zonder keepers
+            if area_per_player < 80:
+                return "📏 Klein", "Korte afstanden"
+            elif area_per_player < 200:
+                return "📐 Medium", "Gemiddelde afstanden"
+            else:
+                return "📊 Groot", "Lange afstanden"
+    
+    distance_category, distance_desc = get_distance_category(area_per_player, met_keepers)
+    
+    # Bepaal drill intensiteit op basis van onderzoek (conform wetenschappelijke bronnen)
+    if met_keepers:
+        intensief_range = (74, 185)  # Intensief met keepers: 121 ± 47 m²
+        extensief_range = (185, 479)  # Extensief met keepers: 350 ± 129 m²
+        match_sim = 340
+    else:
+        intensief_range = (51, 106)   # Intensief zonder keepers: 78 ± 27 m²
+        extensief_range = (106, 400)  # Extensief zonder keepers: 253 ± 147 m²
+        match_sim = 280
+    
+    if intensief_range[0] <= area_per_player <= intensief_range[1]:
+        drill_type = "🔥 Intensief"
+        intensity_color = "🔴"
+    elif extensief_range[0] <= area_per_player <= extensief_range[1]:
+        drill_type = "📏 Extensief"
+        intensity_color = "🟢"
+    else:
+        drill_type = "⚪ Neutraal"
+        intensity_color = "🟡"
+    
+    # Resultaten weergeven
+    st.markdown("---")
+    st.subheader("📊 Resultaten")
+    
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    
+    with col1:
+        st.metric("🏟️ Totale Oppervlakte", f"{pitch_area} m²")
+    
+    with col2:
+        st.metric("👥 Totaal Spelers", f"{totaal_spelers}")
+    
+    with col3:
+        st.metric("📐 Oppervlakte/Speler", f"{area_per_player} m²")
+    
+    with col4:
+        st.metric("🎮 Game Type", ssg_category)
+    
+    with col5:
+        st.metric("📏 Afstand", distance_category)
+    
+    with col6:
+        st.metric("🎯 Intensiteit", drill_type)
+    
+    # Visuele weergave
+    st.markdown("---")
+    col_vis1, col_vis2 = st.columns([2, 1])
+    
+    with col_vis1:
+        st.subheader("📈 Training Zones Overzicht")
+        
+        # Maak horizontale bar chart met zones
+        fig = go.Figure()
+        
+        if met_keepers:
+            zones_data = [
+                {"zone": "🔥 Intensief", "min": 74, "max": 185, "color": "#FF6B6B", "focus": "Acceleratie & Techniek", "optimal": 121},
+                {"zone": "📏 Extensief", "min": 185, "max": 479, "color": "#4ECDC4", "focus": "Afstand & Sprint", "optimal": 350},
+                {"zone": "⚽ Wedstrijd", "min": 340, "max": 340, "color": "#45B7D1", "focus": "Match Simulatie", "optimal": 340}
+            ]
+        else:
+            zones_data = [
+                {"zone": "🔥 Intensief", "min": 51, "max": 106, "color": "#FF6B6B", "focus": "Acceleratie & Techniek", "optimal": 78},
+                {"zone": "📏 Extensief", "min": 106, "max": 400, "color": "#4ECDC4", "focus": "Afstand & Sprint", "optimal": 253},
+                {"zone": "⚪ Gemiddeld", "min": 280, "max": 280, "color": "#95A5A6", "focus": "Algemeen", "optimal": 280}
+            ]
+        
+        # Voeg zones toe als bars
+        y_pos = 0
+        for zone in zones_data:
+            if zone["min"] == zone["max"]:  # Referentielijn
+                fig.add_trace(go.Scatter(
+                    x=[zone["min"]],
+                    y=[y_pos],
+                    mode='markers',
+                    marker=dict(size=15, color=zone["color"], symbol='diamond'),
+                    name=zone["zone"],
+                    text=f"{zone['zone']}: {zone['min']}m²",
+                    hovertemplate=f"<b>{zone['zone']}</b><br>Waarde: {zone['min']}m²<br>Focus: {zone['focus']}<extra></extra>"
+                ))
+            else:  # Zone bereik
+                # Toon zone bereik als lijn
+                fig.add_trace(go.Scatter(
+                    x=[zone["min"], zone["max"]],
+                    y=[y_pos, y_pos],
+                    mode='lines',
+                    line=dict(color=zone["color"], width=8),
+                    name=zone["zone"],
+                    text=f"{zone['zone']}: {zone['min']}-{zone['max']}m²",
+                    hovertemplate=f"<b>{zone['zone']}</b><br>Bereik: {zone['min']}-{zone['max']}m²<br>Optimaal: {zone['optimal']}m²<br>Focus: {zone['focus']}<extra></extra>"
+                ))
+                
+                # Toon optimale waarde als punt
+                fig.add_trace(go.Scatter(
+                    x=[zone["optimal"]],
+                    y=[y_pos],
+                    mode='markers',
+                    marker=dict(size=12, color=zone["color"], symbol='circle', line=dict(width=2, color='white')),
+                    name=f"{zone['zone']} Optimaal",
+                    text=f"Optimaal: {zone['optimal']}m²",
+                    hovertemplate=f"<b>{zone['zone']} - Optimaal</b><br>Waarde: {zone['optimal']}m²<br>Focus: {zone['focus']}<extra></extra>"
+                ))
+                
+            y_pos += 1
+        
+        # Voeg jouw configuratie toe
+        fig.add_trace(go.Scatter(
+            x=[area_per_player],
+            y=[y_pos],
+            mode='markers',
+            marker=dict(size=20, color='orange', symbol='star'),
+            name="Jouw Configuratie",
+            text=f"Jouw setup: {area_per_player}m²",
+            hovertemplate=f"<b>Jouw Configuratie</b><br>Waarde: {area_per_player}m²<br>Type: {drill_type}<extra></extra>"
+        ))
+        
+        fig.update_layout(
+            title="Training Zones & Jouw Configuratie",
+            xaxis_title="Oppervlakte per Speler (m²)",
+            yaxis=dict(
+                tickvals=list(range(len(zones_data) + 1)),
+                ticktext=[zone["zone"] for zone in zones_data] + ["🎯 Jouw Setup"],
+                title=""
+            ),
+            height=350,
+            showlegend=False,
+            xaxis=dict(range=[0, 500 if met_keepers else 450])
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col_vis2:
+        st.subheader("🎯 Training Analyse")
+        
+        # Game Type informatie
+        st.markdown(f"**{ssg_category}**")
+        if ssg_abbrev == "SSG":
+            st.write("• 1v1 tot 4v4 spellen")
+            st.write("• Focus op techniek & beslissingen")
+            st.write("• Hoge speler betrokkenheid")
+        elif ssg_abbrev == "MSG":
+            st.write("• 5v5 tot 7v7 spellen") 
+            st.write("• Balans tussen ruimte & druk")
+            st.write("• Tactische principes")
+        else:  # LSG
+            st.write("• 8v8+ spellen")
+            st.write("• Wedstrijdgerelateerde situaties")
+            st.write("• Formatie & groepswerk")
+        
+        st.markdown("---")
+        
+        # Afstand/Intensiteit combinatie
+        st.markdown(f"**{distance_category} + {drill_type}**")
+        
+        if drill_type == "🔥 Intensief" and "Klein" in distance_category:
+            st.success("""
+            **Klein + Intensief:**
+            - ⚡ Explosieve acties
+            - 🎯 Techniek onder druk
+            - 🤝 Veel duels
+            - ⏱️ Korte work periods
+            """)
+        elif drill_type == "📏 Extensief" and "Groot" in distance_category:
+            st.info("""
+            **Groot + Extensief:**
+            - 🏃 Hoge totale afstand
+            - 💨 Aerobe capaciteit
+            - 🚀 Sprint training
+            - 🔄 Lange work periods
+            """)
+        elif "Medium" in distance_category:
+            st.warning("""
+            **Medium Afstanden:**
+            - ⚖️ Gebalanceerde training
+            - 🔄 Wisselende intensiteit
+            - 📊 Allround ontwikkeling
+            - 🎯 Variatie in acties
+            """)
+        else:
+            st.info(f"""
+            **{distance_desc} + {drill_type.replace('🔥 ', '').replace('📏 ', '').replace('⚪ ', '')}:**
+            - Combinatie van afstand en intensiteit
+            - Aangepaste training focus
+            - Specifieke doelstellingen
+            """)
+    
+    # Aanbevelingen
+    st.markdown("---")
+    st.subheader("💡 Aanbevelingen")
+    
+    col_rec1, col_rec2, col_rec3 = st.columns(3)
+    
+    with col_rec1:
+        st.markdown("**🎯 Voor Intensieve Training:**")
+        if met_keepers:
+            recommended_area_int = 121  # 121 ± 47 m² (range: 74-185)
+            range_text = "74-185m²"
+        else:
+            recommended_area_int = 78   # 78 ± 27 m² (range: 51-106) 
+            range_text = "51-106m²"
+        
+        recommended_players_int = round(pitch_area / recommended_area_int)
+        st.write(f"- Gebruik ~{recommended_players_int} spelers totaal")
+        st.write(f"- Optimaal: ~{recommended_area_int}m² per speler")
+        st.write(f"- Bereik: {range_text}")
+        st.write(f"- Focus: Klein tot medium afstanden")
+        
+    with col_rec2:
+        st.markdown("**📏 Voor Extensieve Training:**")
+        if met_keepers:
+            recommended_area_ext = 350  # 350 ± 129 m² (range: 185-479)
+            range_text = "185-479m²"
+        else:
+            recommended_area_ext = 253  # 253 ± 147 m² (range: 106-400)
+            range_text = "106-400m²"
+        
+        recommended_players_ext = round(pitch_area / recommended_area_ext)
+        st.write(f"- Gebruik ~{recommended_players_ext} spelers totaal")
+        st.write(f"- Optimaal: ~{recommended_area_ext}m² per speler")
+        st.write(f"- Bereik: {range_text}")
+        st.write(f"- Focus: Medium tot grote afstanden")
+        
+    with col_rec3:
+        st.markdown(f"**🎮 Voor {ssg_abbrev} Spellen:**")
+        if ssg_abbrev == "SSG":
+            st.write("- 3v3 tot 4v4+2 ideaal")
+            st.write("- Veld: 20x15m tot 40x30m")
+            st.write("- Focus: Techniek & snelle beslissingen")
+            st.write("- Duur: 2-4 min work periods")
+        elif ssg_abbrev == "MSG":
+            st.write("- 5v5 tot 7v7 ideaal")
+            st.write("- Veld: 40x30m tot 70x50m")
+            st.write("- Focus: Tactiek & transities")
+            st.write("- Duur: 4-8 min work periods")
+        else:  # LSG
+            st.write("- 8v8 tot 11v11 ideaal")
+            st.write("- Veld: 70x50m tot volledige pitch")
+            st.write("- Focus: Wedstrijdsituaties")
+            st.write("- Duur: 8-15 min work periods")
+
+elif option == 'Veld Afmetingen berekenen':
+    st.header("📐 Bereken Optimale Veld Afmetingen")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        target_area = st.number_input('Gewenste Oppervlakte per Speler (m²)', 
+                                    min_value=50, max_value=500, value=200, step=10)
+        total_players = st.number_input('Totaal Aantal Spelers', 
+                                      min_value=2, max_value=28, value=12, step=1)
+    
+    with col2:
+        # Verschillende ratio opties
+        ratio_options = {
+            "⚽ Standaard Voetbal (1.55:1)": 1.55,
+            "🏟️ FIFA Aanbeveling (1.54:1)": 1.54,
+            "📐 Gouden Verhouding (1.62:1)": 1.62,
+            "🎯 Aangepast": 1.5
+        }
+        
+        selected_ratio = st.selectbox("Lengte/Breedte Verhouding:", list(ratio_options.keys()))
+        
+        if selected_ratio == "🎯 Aangepast":
+            width_length_ratio = st.slider("Aangepaste ratio", 1.0, 2.0, 1.5, 0.1)
+        else:
+            width_length_ratio = ratio_options[selected_ratio]
+    
+    # Berekeningen
+    total_area = target_area * total_players
+    
+    # Bereken afmetingen op basis van ratio
+    length_meters = math.sqrt(total_area * width_length_ratio)
+    width_meters = total_area / length_meters
+    
+    length_m = round(length_meters)
+    width_m = round(width_meters)
+    actual_area = length_m * width_m
+    actual_area_per_player = round(actual_area / total_players, 1)
+    
+    # Resultaten
+    st.markdown("---")
+    st.subheader("📊 Berekende Veld Afmetingen")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("📏 Lengte", f"{length_m} m")
+    
+    with col2:
+        st.metric("📐 Breedte", f"{width_m} m")
+    
+    with col3:
+        st.metric("🏟️ Totale Oppervlakte", f"{actual_area} m²")
+    
+    with col4:
+        st.metric("👤 Werkelijke m²/Speler", f"{actual_area_per_player} m²")
+    
+    # Visueel veld
+    st.markdown("---")
+    st.subheader("🏟️ Veld Visualisatie")
+    
+    # Maak een simpele veld visualisatie
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    # Teken veld
+    field = plt.Rectangle((0, 0), length_m, width_m, linewidth=2, 
+                         edgecolor='green', facecolor='lightgreen', alpha=0.3)
+    ax.add_patch(field)
+    
+    # Middenlijn
+    ax.axvline(x=length_m/2, color='white', linewidth=2)
+    
+    # Middencirkel
+    circle = plt.Circle((length_m/2, width_m/2), width_m/6, 
+                       fill=False, color='white', linewidth=2)
+    ax.add_patch(circle)
+    
+    # Doelen
+    goal_width = width_m/10
+    goal_depth = length_m/20
+    
+    # Doel 1
+    goal1 = plt.Rectangle((0, (width_m-goal_width)/2), goal_depth, goal_width,
+                         linewidth=2, edgecolor='white', facecolor='yellow', alpha=0.5)
+    ax.add_patch(goal1)
+    
+    # Doel 2
+    goal2 = plt.Rectangle((length_m-goal_depth, (width_m-goal_width)/2), goal_depth, goal_width,
+                         linewidth=2, edgecolor='white', facecolor='yellow', alpha=0.5)
+    ax.add_patch(goal2)
+    
+    # Spelers verdelen
+    players_per_side = total_players // 2
+    
+    # Team 1 (links)
+    for i in range(players_per_side):
+        x = length_m * 0.25
+        y = width_m * (i + 1) / (players_per_side + 1)
+        ax.plot(x, y, 'ro', markersize=8)
+    
+    # Team 2 (rechts)
+    for i in range(total_players - players_per_side):
+        x = length_m * 0.75
+        y = width_m * (i + 1) / (total_players - players_per_side + 1)
+        ax.plot(x, y, 'bo', markersize=8)
+    
+    ax.set_xlim(-5, length_m + 5)
+    ax.set_ylim(-5, width_m + 5)
+    ax.set_aspect('equal')
+    ax.set_title(f'Veld Layout: {length_m}m x {width_m}m ({actual_area_per_player}m²/speler)', 
+                fontsize=14, fontweight='bold')
+    ax.set_xlabel('Lengte (m)')
+    ax.set_ylabel('Breedte (m)')
+    
+    st.pyplot(fig)
+
+elif option == 'Vergelijk Configuraties':
+    st.header("⚖️ Vergelijk Verschillende SSG Configuraties")
+    
+    st.markdown("Vergelijk tot 4 verschillende configuraties om de beste keuze te maken:")
+    
+    # Maak 4 kolommen voor vergelijking
+    cols = st.columns(4)
+    
+    configurations = []
+    
+    for i, col in enumerate(cols):
+        with col:
+            st.markdown(f"### Configuratie {i+1}")
+            
+            config = {}
+            config['name'] = st.text_input(f"Naam", value=f"Config {i+1}", key=f"name_{i}")
+            config['team1'] = st.number_input("Team 1", 1, 15, 6, key=f"t1_{i}")
+            config['team2'] = st.number_input("Team 2", 1, 15, 6, key=f"t2_{i}")
+            config['neutrals'] = st.number_input("Neutrals", 0, 6, 0, key=f"n_{i}")
+            config['length'] = st.number_input("Lengte", 10, 110, 50, key=f"l_{i}")
+            config['width'] = st.number_input("Breedte", 10, 70, 35, key=f"w_{i}")
+            config['keepers'] = st.checkbox("Met Keepers", key=f"k_{i}")
+            
+            # Berekeningen
+            total_players = config['team1'] + config['team2'] + config['neutrals']
+            area = config['length'] * config['width']
+            area_per_player = round(area / total_players, 1)
+            
+            # Bepaal SSG type en afstand categorie (zoals in hoofdfunctie)
+            def get_ssg_size_compare(total_players):
+                if total_players <= 8:
+                    return "🔸 SSG"
+                elif total_players <= 14:
+                    return "🔹 MSG"
+                else:
+                    return "🔺 LSG"
+            
+            def get_distance_category_compare(area_per_player, with_keepers=False):
+                if with_keepers:
+                    if area_per_player < 120:
+                        return "📏 Klein"
+                    elif area_per_player < 280:
+                        return "📐 Medium"
+                    else:
+                        return "📊 Groot"
+                else:
+                    if area_per_player < 80:
+                        return "📏 Klein"
+                    elif area_per_player < 200:
+                        return "📐 Medium"
+                    else:
+                        return "📊 Groot"
+            
+            ssg_type = get_ssg_size_compare(total_players)
+            distance_cat = get_distance_category_compare(area_per_player, config['keepers'])
+            
+            # Bepaal intensiteit type (consistent met wetenschappelijke waarden)
+            if config['keepers']:
+                if 74 <= area_per_player <= 185:  # 121 ± 47 m²
+                    drill_type = "🔥 Intensief"
+                elif 185 <= area_per_player <= 479:  # 350 ± 129 m²
+                    drill_type = "📏 Extensief"
+                else:
+                    drill_type = "⚪ Neutraal"
+            else:
+                if 51 <= area_per_player <= 106:  # 78 ± 27 m²
+                    drill_type = "🔥 Intensief"
+                elif 106 <= area_per_player <= 400:  # 253 ± 147 m²
+                    drill_type = "📏 Extensief"
+                else:
+                    drill_type = "⚪ Neutraal"
+            
+            config['total_players'] = total_players
+            config['area'] = area
+            config['area_per_player'] = area_per_player
+            config['ssg_type'] = ssg_type
+            config['distance_category'] = distance_cat
+            config['drill_type'] = drill_type
+            
+            # Toon resultaten
+            st.metric("👥 Totaal", total_players)
+            st.metric("🏟️ Oppervlakte", f"{area} m²")
+            st.metric("📐 m²/Speler", area_per_player)
+            st.metric("🎮 Type", ssg_type)
+            st.metric("📏 Afstand", distance_cat)
+            
+            if drill_type == "🔥 Intensief":
+                st.success(drill_type)
+            elif drill_type == "📏 Extensief":
+                st.info(drill_type)
+            else:
+                st.warning(drill_type)
+            
+            configurations.append(config)
+    
+    # Vergelijkingstabel
+    st.markdown("---")
+    st.subheader("📊 Vergelijkingstabel")
+    
+    df_compare = pd.DataFrame({
+        'Configuratie': [c['name'] for c in configurations],
+        'Spelers': [f"{c['team1']}v{c['team2']}" + (f"+{c['neutrals']}" if c['neutrals'] > 0 else "") for c in configurations],
+        'Afmetingen': [f"{c['length']}x{c['width']}m" for c in configurations],
+        'Totaal Spelers': [c['total_players'] for c in configurations],
+        'Oppervlakte': [f"{c['area']} m²" for c in configurations],
+        'm²/Speler': [c['area_per_player'] for c in configurations],
+        'Game Type': [c['ssg_type'] for c in configurations],
+        'Afstand': [c['distance_category'] for c in configurations],
+        'Intensiteit': [c['drill_type'] for c in configurations]
+    })
+    
+    st.dataframe(df_compare, use_container_width=True)
+    
+    # Vergelijkingsgrafiek
+    st.subheader("📈 Visuele Vergelijking")
+    
+    fig = go.Figure()
+    
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4']
+    
+    for i, config in enumerate(configurations):
+        fig.add_trace(go.Bar(
+            name=config['name'],
+            x=['Oppervlakte per Speler'],
+            y=[config['area_per_player']],
+            marker_color=colors[i],
+            text=f"{config['area_per_player']}m²",
+            textposition='auto'
+        ))
+    
+    # Voeg zone lijnen toe
+    fig.add_hline(y=121, line_dash="dash", line_color="red", 
+                 annotation_text="Intensief (met keepers)")
+    fig.add_hline(y=350, line_dash="dash", line_color="green", 
+                 annotation_text="Extensief (met keepers)")
+    
+    fig.update_layout(
+        title="Vergelijking Oppervlakte per Speler",
+        yaxis_title="m² per Speler",
+        height=400
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+# Wetenschappelijke informatie sectie
+with st.expander("📚 Wetenschappelijke Achtergrond"):
+    st.markdown("""
+    ### 🔬 Onderzoeksbasis
+    
+    **Area per Player (ApP)** wordt gedefinieerd als de totale veldoppervlakte gedeeld door het totaal aantal spelers binnen het gegeven gebied (Hill-Haas et al., 2011).
+    
+    #### 🎯 Belangrijke Bevindingen:
+    
+    **🏟️ Wedstrijd Referentie:**
+    - Officiële wedstrijden: ~340m² per speler (Riboli et al., 2020)
+    - Afhankelijk van veldgrootte en aantal spelers
+    
+    **📏 Extensieve Training (Groot Oppervlak):**
+    - ⬆️ Totale afstand
+    - ⬆️ Hoge intensiteit afstand  
+    - ⬆️ Sprint afstanden
+    - Focus op aerobe capaciteit
+    
+    **🔥 Intensieve Training (Klein Oppervlak):**
+    - ⬆️ Acceleraties/deceleraties
+    - ⬆️ Technische eisen
+    - ⬆️ Spelercontact
+    - Focus op anaerobe power
+    
+    #### 📊 Aanbevolen Waarden (Wetenschappelijk Onderbouwd):
+    
+    **Met Keepers:**
+    - 🔥 Intensief: 74-185 m²/speler (optimaal: ~121 m²)
+    - 📏 Extensief: 185-479 m²/speler (optimaal: ~350 m²)
+    - ⚽ Wedstrijd Simulatie: ~340 m²/speler
+    
+    **Zonder Keepers:**
+    - 🔥 Intensief: 51-106 m²/speler (optimaal: ~78 m²)
+    - 📏 Extensief: 106-400 m²/speler (optimaal: ~253 m²)
+    - ⚪ Referentie: ~280 m²/speler
+    
+    #### 🎮 Game Type Classificatie:
+    
+    **🔸 Small Sided Games (SSG) - 2-8 spelers:**
+    - Hoge speler betrokkenheid (>50% ball contact)
+    - Focus op technische vaardigheden
+    - Snelle beslissingen onder druk
+    - Ideaal voor 1v1 tot 4v4+2 formaties
+    
+    **🔹 Medium Sided Games (MSG) - 9-14 spelers:**
+    - Balans tussen individuele en groep acties
+    - Tactische principes development
+    - Transitie training (verdediging ↔ aanval)
+    - Ideaal voor 5v5 tot 7v7 formaties
+    
+    **🔺 Large Sided Games (LSG) - 15+ spelers:**
+    - Wedstrijdgerelateerde situaties
+    - Formatie en groepswerk
+    - Positiespel en ruimte benutten
+    - Ideaal voor 8v8 tot 11v11 formaties
+    
+    #### 📏 Afstand Categorieën:
+    
+    **📏 Klein (Korte Afstanden):**
+    - <80m² per speler (zonder keepers)
+    - <120m² per speler (met keepers)
+    - Focus: Explosiviteit, techniek onder druk
+    
+    **📐 Medium (Gemiddelde Afstanden):**
+    - 80-200m² per speler (zonder keepers)
+    - 120-280m² per speler (met keepers)
+    - Focus: Gebalanceerde training, variatie
+    
+    **📊 Groot (Lange Afstanden):**
+    - >200m² per speler (zonder keepers)
+    - >280m² per speler (met keepers)
+    - Focus: Aerobe capaciteit, sprint training
+    
+    #### 📚 Bronnen:
+    - Hill-Haas, S. V., et al. (2011). Physiology of small-sided games training in football
+    - Lacome, M., et al. (2018). Small-sided games in elite soccer
+    - Riboli, A., et al. (2020). Area per player in small-sided games
+    - Castagna, C., et al. (2019). Physiological responses in SSG formats
+    - Clemente, F. M., et al. (2019). The effects of small-sided games vs. conventional training
+    """)
+
+# Footer
+st.markdown("---")
+st.markdown("**🏆 SPK Dashboard - SSG Calculator** | *Gebaseerd op wetenschappelijk onderzoek*")

@@ -1,0 +1,637 @@
+import streamlit as st
+import pandas as pd
+import datetime
+from typing import Optional
+import sqlite3
+import duckdb
+import os
+
+from db_config import get_database_connection
+from database_helpers import safe_fetchdf
+def show_blessure_rapportage():
+    st.markdown("""
+    <style>
+        .injury-form {
+            background: linear-gradient(135deg, #FAFCFF 0%, #E8F4FD 100%);
+            padding: 1.5rem;
+            border-radius: 10px;
+            border-left: 4px solid #2E86AB;
+            margin: 1rem 0;
+            box-shadow: 0 2px 4px rgba(46, 134, 171, 0.1);
+        }
+        
+        .injury-card {
+            background: white;
+            padding: 1.2rem;
+            border-radius: 8px;
+            border: 1px solid #E8F4FD;
+            margin: 0.8rem 0;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        
+        .injury-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(46, 134, 171, 0.15);
+        }
+        
+        .status-active { color: #E74C3C; font-weight: bold; }
+        .status-recovery { color: #F39C12; font-weight: bold; }
+        .status-healed { color: #27AE60; font-weight: bold; }
+        .status-healthy { 
+            color: #2E8B57; 
+            font-weight: bold; 
+            background: linear-gradient(135deg, #F0FDF4 0%, #DCFCE7 100%);
+            border-left: 4px solid #2E8B57 !important;
+        }
+        .accent-blue { color: #2E86AB; font-weight: bold; }
+        .accent-orange { color: #F18F01; font-weight: bold; }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    st.title("🏥 Blessure Rapportage & Opvolging")
+    
+    # Initialiseer database
+    init_database()
+    
+    # Tabs voor verschillende functionaliteiten
+    tab1, tab2, tab3 = st.tabs(["📝 Nieuwe Blessure", "📊 Overzicht", "📈 Statistieken"])
+    
+    with tab1:
+        show_injury_form()
+    
+    with tab2:
+        show_injury_overview()
+    
+    with tab3:
+        show_injury_statistics()
+
+def init_database():
+    """Initialiseer SQLite database voor blessure tracking"""
+    db_path = "blessures.db"
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS blessures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            speler_naam TEXT NOT NULL,
+            blessure_type TEXT NOT NULL,
+            locatie TEXT NOT NULL,
+            ernst TEXT NOT NULL,
+            datum_start DATE NOT NULL,
+            datum_einde DATE,
+            voorspelling_dagen INTEGER,
+            status TEXT NOT NULL,
+            beschrijving TEXT,
+            behandeling TEXT,
+            opmerkingen TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+
+def show_injury_form():
+    """Formulier voor nieuwe blessure rapportage"""
+    st.markdown('<div class="injury-form">', unsafe_allow_html=True)
+    st.markdown("### <span class='accent-blue'>🩹 Nieuwe Blessure Rapporteren</span>", unsafe_allow_html=True)
+    
+    # Haal spelersnamen op uit database
+    players = get_player_names()
+    
+    with st.form("injury_form"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            speler_naam = st.selectbox(
+                "Speler Naam *", 
+                options=[""] + players,
+                help="Selecteer de speler uit de database"
+            )
+            
+            blessure_type = st.selectbox(
+                "Type Blessure *",
+                [
+                    "Spierblessure",
+                    "Gewrichtsblessure", 
+                    "Overbelasting",
+                    "Traumatisch",
+                    "Huidwond",
+                    "Andere"
+                ]
+            )
+            
+            locatie = st.selectbox(
+                "Locatie *",
+                [
+                    "Enkel",
+                    "Knie",
+                    "Hamstring",
+                    "Quadriceps",
+                    "Kuit",
+                    "Voet",
+                    "Rug",
+                    "Schouder",
+                    "Elleboog",
+                    "Pols/Hand",
+                    "Hoofd/Nek",
+                    "Andere"
+                ]
+            )
+            
+            ernst = st.selectbox(
+                "Ernst *",
+                ["Licht", "Matig", "Zwaar", "Zeer zwaar"]
+            )
+        
+        with col2:
+            datum_start = st.date_input(
+                "Datum Blessure *",
+                value=datetime.date.today(),
+                help="Datum waarop de blessure is opgetreden"
+            )
+            
+            voorspelling_dagen = st.number_input(
+                "Voorspelde uitval (dagen) *",
+                min_value=0,
+                max_value=365,
+                value=7,
+                help="Geschatte duur van uitval in dagen"
+            )
+            
+            status = st.selectbox(
+                "Huidige Status *",
+                ["Actief", "In behandeling", "Genezen"]
+            )
+            
+            datum_einde = st.date_input(
+                "Herstel Datum (optioneel)",
+                value=None,
+                help="Alleen invullen als speler volledig hersteld is"
+            )
+        
+        beschrijving = st.text_area(
+            "Beschrijving Incident",
+            help="Gedetailleerde beschrijving van hoe de blessure ontstond"
+        )
+        
+        behandeling = st.text_area(
+            "Behandelplan",
+            help="Geplande of lopende behandeling"
+        )
+        
+        opmerkingen = st.text_area(
+            "Opmerkingen",
+            help="Aanvullende opmerkingen of observaties"
+        )
+        
+        submitted = st.form_submit_button("💾 Blessure Opslaan", type="primary")
+        
+        if submitted:
+            if speler_naam and blessure_type and locatie and ernst:
+                save_injury(
+                    speler_naam, blessure_type, locatie, ernst,
+                    datum_start, datum_einde, voorspelling_dagen,
+                    status, beschrijving, behandeling, opmerkingen
+                )
+                st.success("✅ Blessure succesvol opgeslagen!")
+                st.rerun()
+            else:
+                st.error("❌ Vul alle verplichte velden in (*)")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+
+def save_injury(speler_naam, blessure_type, locatie, ernst, datum_start, datum_einde, 
+                voorspelling_dagen, status, beschrijving, behandeling, opmerkingen):
+    """Sla nieuwe blessure op in database"""
+    conn = sqlite3.connect("blessures.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        INSERT INTO blessures (
+            speler_naam, blessure_type, locatie, ernst, datum_start, 
+            datum_einde, voorspelling_dagen, status, beschrijving, 
+            behandeling, opmerkingen
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        speler_naam, blessure_type, locatie, ernst, datum_start,
+        datum_einde, voorspelling_dagen, status, beschrijving,
+        behandeling, opmerkingen
+    ))
+    
+    conn.commit()
+    conn.close()
+
+def show_injury_overview():
+    """Overzicht van alle blessures"""
+    st.markdown("### <span class='accent-blue'>📋 Blessure Status - Alle Spelers</span>", unsafe_allow_html=True)
+    
+    # Haal ALLE actieve spelers op uit spelersbeheer
+    try:
+        con = get_database_connection()
+        all_players_query = """
+            SELECT DISTINCT naam 
+            FROM spelers_profiel 
+            WHERE status = 'Actief'
+            ORDER BY naam
+        """
+        all_players = safe_fetchdf(con, all_players_query)
+        
+        if all_players.empty:
+            # Fallback naar thirty_fifteen_results als spelers_profiel leeg is
+            all_players = safe_fetchdf(con, """
+                SELECT DISTINCT Speler as naam 
+                FROM thirty_fifteen_results 
+                ORDER BY Speler
+            """)
+        con.close()
+    except Exception as e:
+        st.error(f"Kon spelers niet ophalen uit database: {e}")
+        return
+    
+    if all_players.empty:
+        st.warning("Geen spelers gevonden in het systeem. Voeg eerst spelers toe via Spelersbeheer.")
+        return
+    
+    # Haal blessure data op
+    injury_df = get_injuries_dataframe()
+    
+    # Merge alle spelers met blessure data (LEFT JOIN)
+    if not injury_df.empty:
+        player_injury_status = all_players.merge(
+            injury_df, 
+            left_on='naam', 
+            right_on='speler_naam', 
+            how='left'
+        )
+    else:
+        # Als geen blessures, maak placeholder dataframe
+        player_injury_status = all_players.copy()
+        player_injury_status['blessure_type'] = None
+        player_injury_status['status'] = None
+        player_injury_status['ernst'] = None
+        player_injury_status['datum_start'] = None
+        player_injury_status['voorspelling_dagen'] = None
+    
+    # Filter opties
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        status_filter = st.selectbox(
+            "Filter op Status",
+            ["Alle", "Gezond", "Actief", "In behandeling", "Genezen"]
+        )
+    
+    with col2:
+        speler_filter = st.selectbox(
+            "Filter op Speler", 
+            ["Alle"] + sorted(all_players['naam'].tolist())
+        )
+    
+    with col3:
+        ernst_filter = st.selectbox(
+            "Filter op Ernst",
+            ["Alle", "Licht", "Matig", "Zwaar", "Zeer zwaar"]
+        )
+    
+    # Filter dataframe
+    filtered_df = player_injury_status.copy()
+    
+    # Status filtering (inclusief gezonde spelers)
+    if status_filter == "Gezond":
+        filtered_df = filtered_df[filtered_df['status'].isna()]
+    elif status_filter != "Alle":
+        filtered_df = filtered_df[filtered_df['status'] == status_filter]
+    
+    # Speler filtering
+    if speler_filter != "Alle":
+        filtered_df = filtered_df[filtered_df['naam'] == speler_filter]
+    
+    # Ernst filtering
+    if ernst_filter != "Alle":
+        filtered_df = filtered_df[filtered_df['ernst'] == ernst_filter]
+    
+    # Toon blessures als cards
+    for _, injury in filtered_df.iterrows():
+        show_injury_card(injury)
+    
+    # Toon ook tabel voor overzicht
+    if not filtered_df.empty:
+        st.markdown("### <span class='accent-blue'>📊 Tabel Overzicht</span>", unsafe_allow_html=True)
+        
+        # Bereken dagen uit roulatie voor spelers met blessures
+        filtered_df['dagen_uit'] = filtered_df.apply(
+            lambda row: calculate_days_out(row) if pd.notna(row['status']) else 0, 
+            axis=1
+        )
+        
+        # Maak display kolommen
+        display_df = filtered_df.copy()
+        display_df['speler_naam'] = display_df['naam']  # Gebruik naam kolom
+        display_df['blessure_status'] = display_df['status'].fillna('Gezond')
+        display_df['blessure_type'] = display_df['blessure_type'].fillna('Geen')
+        display_df['ernst'] = display_df['ernst'].fillna('-')
+        display_df['dagen_uit'] = display_df['dagen_uit'].fillna(0)
+        
+        # Selecteer relevante kolommen voor tabel
+        table_df = display_df[[
+            'speler_naam', 'blessure_status', 'blessure_type', 'ernst', 
+            'datum_start', 'voorspelling_dagen', 'dagen_uit'
+        ]].copy()
+        
+        st.dataframe(
+            table_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "speler_naam": "Speler",
+                "blessure_status": "Status", 
+                "blessure_type": "Type Blessure",
+                "ernst": "Ernst",
+                "datum_start": "Start Datum",
+                "voorspelling_dagen": "Voorspelling (dagen)",
+                "dagen_uit": "Dagen Uit"
+            }
+        )
+        
+        # Statistieken
+        st.markdown("### <span class='accent-orange'>📈 Statistieken</span>", unsafe_allow_html=True)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            total_players = len(display_df)
+            st.metric("👥 Totaal Spelers", total_players)
+        
+        with col2:
+            healthy_players = len(display_df[display_df['blessure_status'] == 'Gezond'])
+            st.metric("✅ Gezonde Spelers", healthy_players, delta=f"{(healthy_players/total_players*100):.0f}%")
+        
+        with col3:
+            injured_players = len(display_df[display_df['blessure_status'] != 'Gezond'])
+            st.metric("🩹 Geblesseerde Spelers", injured_players)
+        
+        with col4:
+            if injured_players > 0:
+                avg_days_out = display_df[display_df['dagen_uit'] > 0]['dagen_uit'].mean()
+                st.metric("📊 Gem. Dagen Uit", f"{avg_days_out:.1f}" if pd.notna(avg_days_out) else "0")
+            else:
+                st.metric("📊 Gem. Dagen Uit", "0")
+
+def show_injury_card(player):
+    """Toon individuele speler card (met of zonder blessure)"""
+    
+    # Check of speler een blessure heeft
+    if pd.isna(player['status']) or player['status'] is None:
+        # Gezonde speler - gebruik Streamlit containers
+        with st.container():
+            st.success(f"👤 **{player['naam']}** - ✅ **Gezond**")
+            st.info("🎯 Geen blessures geregistreerd - Speler is beschikbaar voor training en wedstrijden")
+            st.divider()
+    else:
+        # Speler met blessure
+        status_colors = {
+            "Actief": "🔴",
+            "In behandeling": "🟡", 
+            "Genezen": "🟢"
+        }
+        
+        dagen_uit = calculate_days_out(player)
+        speler_naam = player['naam'] if 'naam' in player else player['speler_naam']
+        
+        with st.container():
+            # Header met status
+            status_icon = status_colors.get(player['status'], '⚪')
+            if player['status'] == 'Actief':
+                st.error(f"👤 **{speler_naam}** - {status_icon} **{player['status']}**")
+            elif player['status'] == 'In behandeling':
+                st.warning(f"👤 **{speler_naam}** - {status_icon} **{player['status']}**")
+            else:
+                st.success(f"👤 **{speler_naam}** - {status_icon} **{player['status']}**")
+            
+            # Details in kolommen
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write(f"🩹 **Type:** {player['blessure_type'] or 'N/A'}")
+                st.write(f"📍 **Locatie:** {player['locatie'] if 'locatie' in player else 'N/A'}")
+                st.write(f"⚠️ **Ernst:** {player['ernst'] or 'N/A'}")
+            
+            with col2:
+                st.write(f"📅 **Datum:** {player['datum_start'] or 'N/A'}")
+                st.write(f"⏱️ **Voorspelling:** {player['voorspelling_dagen'] or 'N/A'} dagen")
+                st.write(f"📊 **Actueel uit:** {dagen_uit} dagen")
+            
+            # Extra informatie
+            if 'beschrijving' in player and player['beschrijving']:
+                st.write(f"📝 **Beschrijving:** {player['beschrijving']}")
+            
+            if 'behandeling' in player and player['behandeling']:
+                st.write(f"🏥 **Behandeling:** {player['behandeling']}")
+            
+            if 'opmerkingen' in player and player['opmerkingen']:
+                st.write(f"💭 **Opmerkingen:** {player['opmerkingen']}")
+            
+            # Timestamps
+            if 'created_at' in player and player['created_at']:
+                st.caption(f"Aangemaakt: {player['created_at'][:10]}")
+            
+            # Update en Delete knoppen voor elke blessure (alleen als speler een blessure heeft)
+            if 'id' in player and player['id']:
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    if st.button(f"✏️ Update {speler_naam}", key=f"update_{player['id']}"):
+                        show_update_form(player)
+                
+                with col2:
+                    if st.button(f"🗑️ Verwijder", key=f"delete_{player['id']}", type="secondary"):
+                        if st.session_state.get(f"confirm_delete_{player['id']}", False):
+                            delete_injury(player['id'])
+                            st.success(f"Blessure van {speler_naam} is verwijderd!")
+                            st.rerun()
+                        else:
+                            st.session_state[f"confirm_delete_{player['id']}"] = True
+                            st.warning("Klik nogmaals om te bevestigen")
+                            st.rerun()
+            
+            st.divider()
+
+def show_update_form(injury):
+    """Toon update formulier voor bestaande blessure"""
+    st.markdown("### 🔄 Blessure Updaten")
+    
+    with st.form(f"update_form_{injury['id']}"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            new_status = st.selectbox(
+                "Status",
+                ["Actief", "In behandeling", "Genezen"],
+                index=["Actief", "In behandeling", "Genezen"].index(injury['status'])
+            )
+            
+            new_datum_einde = st.date_input(
+                "Herstel Datum",
+                value=datetime.datetime.strptime(injury['datum_einde'], '%Y-%m-%d').date() if injury['datum_einde'] else None
+            )
+        
+        with col2:
+            new_behandeling = st.text_area(
+                "Behandelplan Update",
+                value=injury['behandeling'] or ""
+            )
+            
+            new_opmerkingen = st.text_area(
+                "Nieuwe Opmerkingen",
+                value=injury['opmerkingen'] or ""
+            )
+        
+        if st.form_submit_button("💾 Update Opslaan"):
+            update_injury(
+                injury['id'], new_status, new_datum_einde, 
+                new_behandeling, new_opmerkingen
+            )
+            st.success("✅ Blessure bijgewerkt!")
+            st.rerun()
+
+def update_injury(injury_id, status, datum_einde, behandeling, opmerkingen):
+    """Update bestaande blessure"""
+    conn = sqlite3.connect("blessures.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        UPDATE blessures 
+        SET status = ?, datum_einde = ?, behandeling = ?, opmerkingen = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (status, datum_einde, behandeling, opmerkingen, injury_id))
+    
+    conn.commit()
+    conn.close()
+
+def delete_injury(injury_id):
+    """Verwijder een blessure uit de database"""
+    conn = sqlite3.connect("blessures.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("DELETE FROM blessures WHERE id = ?", (injury_id,))
+    
+    conn.commit()
+    conn.close()
+
+def show_injury_statistics():
+    """Toon blessure statistieken"""
+    st.markdown("### <span class='accent-blue'>📈 Blessure Statistieken</span>", unsafe_allow_html=True)
+    
+    df = get_injuries_dataframe()
+    
+    if df.empty:
+        st.info("🔍 Geen data beschikbaar voor statistieken.")
+        return
+    
+    # Key metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Totaal Blessures", len(df))
+    
+    with col2:
+        active_count = len(df[df['status'].isin(['Actief', 'In behandeling'])])
+        st.metric("Actieve Blessures", active_count)
+    
+    with col3:
+        avg_days = df['voorspelling_dagen'].mean()
+        st.metric("Gem. Uitval (dagen)", f"{avg_days:.1f}")
+    
+    with col4:
+        healed_count = len(df[df['status'] == 'Genezen'])
+        st.metric("Genezen", healed_count)
+    
+    # Charts
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("#### 🩹 Blessures per Type")
+        type_counts = df['blessure_type'].value_counts()
+        st.bar_chart(type_counts)
+    
+    with col2:
+        st.markdown("#### 📍 Blessures per Locatie")
+        location_counts = df['locatie'].value_counts()
+        st.bar_chart(location_counts)
+    
+    # Status verdeling
+    st.markdown("#### 📊 Status Verdeling")
+    status_counts = df['status'].value_counts()
+    st.bar_chart(status_counts)
+    
+    # Ernst verdeling
+    st.markdown("#### ⚠️ Ernst Verdeling")
+    severity_counts = df['ernst'].value_counts()
+    st.bar_chart(severity_counts)
+
+def get_injuries_dataframe():
+    """Haal alle blessures op uit database als DataFrame"""
+    conn = sqlite3.connect("blessures.db")
+    
+    try:
+        df = pd.read_sql_query("""
+            SELECT * FROM blessures 
+            ORDER BY created_at DESC
+        """, conn)
+        return df
+    except:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+def calculate_days_out(injury):
+    """Bereken aantal dagen uit de roulatie"""
+    start_date = datetime.datetime.strptime(injury['datum_start'], '%Y-%m-%d').date()
+    
+    if injury['datum_einde'] and injury['status'] == 'Genezen':
+        end_date = datetime.datetime.strptime(injury['datum_einde'], '%Y-%m-%d').date()
+        return (end_date - start_date).days
+    else:
+        return (datetime.date.today() - start_date).days
+
+def get_player_names():
+    """Haal alle spelersnamen op uit de hoofddatabase"""
+    try:
+        # Verbind met DuckDB database
+        conn = get_database_connection()
+        
+        # Haal unieke spelersnamen op uit ALLE tabellen (inclusief handmatig ingevoerde spelers)
+        query = """
+        SELECT DISTINCT naam FROM spelers_profiel
+        UNION
+        SELECT DISTINCT Speler as naam FROM thirty_fifteen_results
+        UNION
+        SELECT DISTINCT speler as naam FROM gps_data
+        ORDER BY naam
+        """
+        
+        result = conn.execute(query).fetchall()
+        conn.close()
+        
+        # Converteer naar lijst van strings
+        players = [row[0] for row in result if row[0] is not None]
+        return players
+        
+    except Exception as e:
+        st.error(f"Fout bij ophalen spelersnamen: {e}")
+        # Fallback naar handmatige lijst
+        return [
+            "Barry Djaumo", "Brian Roekens", "Brusk Er", "Daan Straetmans", 
+            "Daan Vanhoof", "Jari Decraemer", "Joy Matuta", "Matis Willeput",
+            "Niels Vaesen", "Nik Vangrunderbeek", "Samuel Sanchez", 
+            "Senne Goossens", "Stan Roosen", "Thomas Desmet", "Tom Goovaerts",
+            "Wannes Van Tricht", "Yani Urdinov", "Yoan Yangassa"
+        ]
+
+if __name__ == "__main__":
+    show_blessure_rapportage()

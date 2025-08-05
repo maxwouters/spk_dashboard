@@ -1,0 +1,485 @@
+import streamlit as st
+
+# Supabase helpers (primary)
+try:
+    from supabase_helpers import (
+        get_table_data, 
+        get_thirty_fifteen_results, 
+        get_cached_player_list,
+        test_supabase_connection,
+        safe_fetchdf,
+        check_table_exists
+    )
+    SUPABASE_MODE = True
+except ImportError:
+    # Fallback to legacy
+    from db_config import get_database_connection
+    from database_helpers import check_table_exists, get_table_columns, add_column_if_not_exists, safe_fetchdf
+    SUPABASE_MODE = False
+
+# Database setup
+if SUPABASE_MODE:
+    st.info("🌐 Using Supabase database")
+    if not test_supabase_connection():
+        st.error("❌ Cannot connect to Supabase")
+        st.stop()
+    con = None  # Will use Supabase helpers
+else:
+    # Legacy mode
+    try:
+        con = get_database_connection()
+    except NameError:
+        st.error("❌ Database connection not available")
+        st.stop()
+import pandas as pd
+from datetime import datetime
+
+
+# Database compatibility functions
+def execute_db_query(query, params=None):
+    """Execute query and return results compatible with both databases"""
+    if SUPABASE_MODE:
+        try:
+            df = safe_fetchdf(query, params or {})
+            if df.empty:
+                return []
+            # Convert DataFrame to list of tuples (like fetchall())
+            return [tuple(row) for row in df.values]
+        except Exception as e:
+            st.error(f"Query failed: {e}")
+            return []
+    else:
+        # Legacy mode
+        try:
+            if params:
+                return execute_db_query(query, params)
+            else:
+                return execute_db_query(query)
+        except Exception as e:
+            st.error(f"Legacy query failed: {e}")
+            return []
+
+def get_supabase_data(table_name, columns="*", where_conditions=None):
+    """Get data using Supabase helpers"""
+    if SUPABASE_MODE:
+        return get_table_data(table_name, columns, where_conditions)
+    else:
+        # Legacy fallback
+        query = f"SELECT {columns} FROM {table_name}"
+        if where_conditions:
+            conditions = [f"{k} = '{v}'" for k, v in where_conditions.items()]
+            query += f" WHERE {' AND '.join(conditions)}"
+        return safe_fetchdf(query)
+
+st.set_page_config(page_title="Trainingskalender - SPK Dashboard", layout="wide")
+
+st.title("📅 Trainingskalender")
+
+# Database connectie voor trainingen
+# Legacy mode fallback
+try:
+    con = get_database_connection()
+except NameError:
+    st.error("❌ Database connection not available")
+    st.stop()
+# Maak trainings tabel aan
+execute_db_query("""
+    CREATE TABLE IF NOT EXISTS trainings_calendar (
+        training_id INTEGER PRIMARY KEY,
+        datum DATE,
+        type TEXT,
+        omschrijving TEXT,
+        geplande_duur_minuten INTEGER DEFAULT 90,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+# Voeg kolom toe als deze nog niet bestaat
+try:
+    execute_db_query("ALTER TABLE trainings_calendar ADD COLUMN geplande_duur_minuten INTEGER DEFAULT 90")
+except:
+    pass  # Kolom bestaat al
+
+# Maak sequence voor training_id als deze nog niet bestaat
+try:
+    execute_db_query("CREATE SEQUENCE IF NOT EXISTS training_id_seq START 1")
+except:
+    pass
+
+# Maak aanwezigheid tabel aan
+execute_db_query("""
+    CREATE TABLE IF NOT EXISTS training_attendance (
+        attendance_id INTEGER PRIMARY KEY,
+        training_id INTEGER,
+        speler TEXT,
+        status TEXT,
+        FOREIGN KEY (training_id) REFERENCES trainings_calendar(training_id)
+    )
+""")
+
+# Maak sequence voor attendance_id als deze nog niet bestaat
+try:
+    execute_db_query("CREATE SEQUENCE IF NOT EXISTS attendance_id_seq START 1")
+except:
+    pass
+
+# Twee kolommen: links planning, rechts kalender overzicht
+col1, col2 = st.columns([1, 1])
+
+with col1:
+    st.markdown("### ➕ Nieuwe Training/Wedstrijd Toevoegen")
+    
+    with st.form("nieuwe_training"):
+        training_datum = st.date_input("📅 Datum", value=datetime.today().date())
+        training_type = st.selectbox("🏃 Type", ["Training", "Wedstrijd", "Vriendschappelijk", "Test"])
+        training_omschrijving = st.text_area("📝 Omschrijving", placeholder="Bijv. Interval training, Thuiswedstrijd vs Team X")
+        training_duur = st.number_input("⏱️ Geplande Duur (minuten)", min_value=15, max_value=180, value=90, step=5,
+                                      help="Deze duur wordt gebruikt voor GPS en RPE berekeningen")
+        
+        submitted = st.form_submit_button("✅ Training Toevoegen")
+        
+        if submitted:
+            # Voeg training toe aan database (SQLite auto-increment)
+            execute_db_query("""
+                INSERT INTO trainings_calendar (datum, type, omschrijving, geplande_duur_minuten)
+                VALUES (?, ?, ?, ?)
+            """, (training_datum, training_type, training_omschrijving, training_duur))
+            
+            st.success(f"✅ {training_type} op {training_datum} toegevoegd!")
+            st.rerun()
+
+with col2:
+    st.markdown("### 📋 Geplande Activiteiten")
+    
+    # Haal alle geplande trainingen op
+    trainings = execute_db_query("""
+        SELECT training_id, datum, type, omschrijving, COALESCE(geplande_duur_minuten, 90) as duur
+        FROM trainings_calendar 
+        ORDER BY datum DESC
+        LIMIT 10
+    """)
+    
+    if trainings:
+        for idx, training in enumerate(trainings):
+            training_id, datum, type_tr, omschrijving, geplande_duur = training
+            
+            # Format datum
+            datum_obj = pd.to_datetime(datum).date()
+            datum_str = datum_obj.strftime("%d/%m/%Y")
+            
+            # Status badge
+            if datum_obj < datetime.today().date():
+                status_badge = "🔴 Voorbij"
+            elif datum_obj == datetime.today().date():
+                status_badge = "🟡 Vandaag"
+            else:
+                status_badge = "🟢 Gepland"
+            
+            with st.expander(f"{type_tr} - {datum_str} {status_badge} ({geplande_duur}min)"):
+                st.write(f"**Omschrijving:** {omschrijving if omschrijving else 'Geen omschrijving'}")
+                st.write(f"**⏱️ Geplande Duur:** {geplande_duur} minuten")
+                
+                # Knop om aanwezigheid in te stellen (gebruik id + loop index voor unieke key)
+                unique_key = f"attend_{training_id}_{idx}"
+                if st.button(f"👥 Aanwezigheid instellen", key=unique_key):
+                    st.session_state[f"selected_training"] = training_id
+                    st.session_state[f"show_attendance"] = True
+                    st.rerun()
+                
+                # Bewerk duur knop  
+                duration_key = f"edit_duration_{training_id}_{idx}"
+                if st.button(f"⏱️ Duur Aanpassen", key=duration_key):
+                    st.session_state[f"edit_training"] = training_id
+                    st.session_state[f"show_edit_form"] = True
+                    st.rerun()
+                
+                # Delete knop
+                delete_key = f"delete_{training_id}_{idx}"
+                if st.button(f"🗑️ Verwijderen", key=delete_key):
+                    execute_db_query("DELETE FROM training_attendance WHERE training_id = ?", (training_id,))
+                    execute_db_query("DELETE FROM trainings_calendar WHERE training_id = ?", (training_id,))
+                    st.success("Training verwijderd!")
+                    st.rerun()
+    else:
+        st.info("📭 Nog geen trainingen gepland")
+
+# Aanwezigheid instellen sectie
+if st.session_state.get("show_attendance", False):
+    selected_training_id = st.session_state.get("selected_training")
+    
+    if selected_training_id:
+        # Haal training details op
+        training_details = (lambda result: result[0] if result else None)(execute_db_query("""
+            SELECT datum, type, omschrijving 
+            FROM trainings_calendar 
+            WHERE training_id = ?
+        """, (selected_training_id,)))
+        
+        if training_details:
+            datum, type_tr, omschrijving = training_details
+            datum_str = pd.to_datetime(datum).date().strftime("%d/%m/%Y")
+            
+            st.markdown("---")
+            st.subheader(f"👥 Aanwezigheid voor {type_tr} - {datum_str}")
+            
+            # Haal alle spelers op uit alle relevante databronnen
+            spelers_query = execute_db_query("""
+                SELECT DISTINCT speler FROM (
+                    SELECT Speler as speler FROM thirty_fifteen_results WHERE Speler IS NOT NULL
+                    UNION 
+                    SELECT speler FROM gps_data WHERE speler IS NOT NULL
+                    UNION
+                    SELECT speler FROM training_attendance WHERE speler IS NOT NULL
+                    UNION
+                    SELECT naam as speler FROM contact_lijst WHERE naam IS NOT NULL
+                ) 
+                WHERE speler IS NOT NULL AND speler != ''
+                ORDER BY speler
+            """)
+            
+            if spelers_query:
+                alle_spelers = [s[0] for s in spelers_query]
+                
+                # Haal bestaande aanwezigheid op
+                bestaande_aanwezigheid = execute_db_query("""
+                    SELECT speler, status 
+                    FROM training_attendance 
+                    WHERE training_id = ?
+                """, (selected_training_id,))
+                
+                bestaande_dict = {speler: status for speler, status in bestaande_aanwezigheid}
+                
+                st.markdown("**Selecteer aanwezige spelers:**")
+                
+                # Selecteer alle / Deselecteer alle knoppen
+                col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 2])
+                with col_btn1:
+                    if st.button("✅ Alle aanwezig", key="all_present"):
+                        for speler in alle_spelers:
+                            st.session_state[f"training_attend_{selected_training_id}_{speler}"] = True
+                with col_btn2:
+                    if st.button("❌ Alle afwezig", key="all_absent"):
+                        for speler in alle_spelers:
+                            st.session_state[f"training_attend_{selected_training_id}_{speler}"] = False
+                
+                # Maak kolommen voor checkboxes
+                cols = st.columns(3)
+                aanwezige_spelers = []
+                
+                for i, speler in enumerate(alle_spelers):
+                    col_idx = i % 3
+                    with cols[col_idx]:
+                        # Default waarde: gebruik bestaande data of True
+                        session_key = f"training_attend_{selected_training_id}_{speler}"
+                        default_value = st.session_state.get(session_key, bestaande_dict.get(speler, "Aanwezig") == "Aanwezig")
+                        
+                        if st.checkbox(speler, value=default_value, key=session_key):
+                            aanwezige_spelers.append(speler)
+                
+                # Sla aanwezigheid op
+                col_save, col_cancel = st.columns([1, 1])
+                with col_save:
+                    if st.button("💾 Aanwezigheid Opslaan", type="primary"):
+                        # Verwijder bestaande aanwezigheid voor deze training
+                        execute_db_query("DELETE FROM training_attendance WHERE training_id = ?", (selected_training_id,))
+                        
+                        # Voeg nieuwe aanwezigheid toe
+                        for speler in alle_spelers:
+                            session_key = f"training_attend_{selected_training_id}_{speler}"
+                            status = "Aanwezig" if st.session_state.get(session_key, False) else "Afwezig"
+                            
+                            execute_db_query("""
+                                INSERT INTO training_attendance (attendance_id, training_id, speler, status)
+                                VALUES (nextval('attendance_id_seq'), ?, ?, ?)
+                            """, (selected_training_id, speler, status))
+                        
+                        st.success("✅ Aanwezigheid opgeslagen!")
+                        st.session_state["show_attendance"] = False
+                        st.rerun()
+                
+                with col_cancel:
+                    if st.button("❌ Annuleren"):
+                        st.session_state["show_attendance"] = False
+                        st.rerun()
+                
+                # Toon huidige status
+                aanwezig_count = len(aanwezige_spelers)
+                totaal_count = len(alle_spelers)
+                st.info(f"📊 Aanwezig: {aanwezig_count}/{totaal_count} spelers")
+                
+            else:
+                st.warning("⚠️ Geen spelers gevonden in database. Voeg eerst testresultaten toe.")
+
+# Training duur bewerken sectie
+if st.session_state.get("show_edit_form", False):
+    edit_training_id = st.session_state.get("edit_training")
+    
+    if edit_training_id:
+        # Haal training details op
+        training_details = (lambda result: result[0] if result else None)(execute_db_query("""
+            SELECT datum, type, omschrijving, COALESCE(geplande_duur_minuten, 90) as duur
+            FROM trainings_calendar 
+            WHERE training_id = ?
+        """, (edit_training_id,)))
+        
+        if training_details:
+            datum, type_tr, omschrijving, huidige_duur = training_details
+            datum_str = pd.to_datetime(datum).date().strftime("%d/%m/%Y")
+            
+            st.markdown("---")
+            st.subheader(f"⏱️ Trainingsduur Aanpassen - {type_tr} op {datum_str}")
+            
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                nieuwe_duur = st.number_input(
+                    "⏱️ Nieuwe Trainingsduur (minuten)",
+                    min_value=15,
+                    max_value=180,
+                    value=int(huidige_duur),
+                    step=5,
+                    help="Deze duur wordt gebruikt voor alle GPS en RPE berekeningen"
+                )
+                
+                # Toon wijziging
+                duur_wijziging = nieuwe_duur - huidige_duur
+                if duur_wijziging != 0:
+                    st.write(f"**Wijziging**: {duur_wijziging:+d} minuten (was {huidige_duur}, wordt {nieuwe_duur})")
+                
+                st.info("💡 **Let op**: Deze wijziging beïnvloedt alle gekoppelde GPS en RPE data voor deze training.")
+            
+            with col2:
+                st.write("**Training Info:**")
+                st.write(f"📅 **Datum**: {datum_str}")
+                st.write(f"🏃 **Type**: {type_tr}")
+                st.write(f"📝 **Omschrijving**: {omschrijving or 'Geen'}")
+                st.write(f"⏱️ **Huidige Duur**: {huidige_duur} min")
+                st.write(f"⏱️ **Nieuwe Duur**: {nieuwe_duur} min")
+            
+            # Actie knoppen
+            col_save, col_cancel = st.columns([1, 1])
+            
+            with col_save:
+                if st.button("💾 Duur Bijwerken", type="primary"):
+                    if nieuwe_duur != huidige_duur:
+                        # Update training calendar
+                        execute_db_query("""
+                            UPDATE trainings_calendar 
+                            SET geplande_duur_minuten = ?
+                            WHERE training_id = ?
+                        """, (nieuwe_duur, edit_training_id))
+                        
+                        # Update gekoppelde GPS data
+                        execute_db_query("""
+                            UPDATE gps_data 
+                            SET session_duur_minuten = ?
+                            WHERE training_id = ?
+                        """, (nieuwe_duur, edit_training_id))
+                        
+                        # Update gekoppelde RPE data (herbereken session_load)
+                        rpe_records = execute_db_query("""
+                            SELECT speler, datum, rpe_score 
+                            FROM rpe_data 
+                            WHERE training_id = ?
+                        """, (edit_training_id,))
+                        
+                        for speler, datum, rpe_score in rpe_records:
+                            nieuwe_session_load = rpe_score * nieuwe_duur
+                            execute_db_query("""
+                                UPDATE rpe_data 
+                                SET session_load = ?
+                                WHERE training_id = ? AND speler = ? AND datum = ?
+                            """, (nieuwe_session_load, edit_training_id, speler, datum))
+                        
+                        st.success(f"✅ Trainingsduur bijgewerkt naar {nieuwe_duur} minuten!")
+                        if rpe_records:
+                            st.success(f"✅ {len(rpe_records)} RPE session loads herberekend!")
+                        
+                        st.session_state["show_edit_form"] = False
+                        st.rerun()
+                    else:
+                        st.info("ℹ️ Geen wijziging - duur is hetzelfde gebleven.")
+            
+            with col_cancel:
+                if st.button("❌ Annuleren"):
+                    st.session_state["show_edit_form"] = False
+                    st.rerun()
+
+# Overzicht van alle aanwezigheden
+st.markdown("---")
+st.subheader("📊 Aanwezigheid Overzicht")
+
+# Haal aanwezigheidsdata op
+attendance_data = execute_db_query("""
+    SELECT tc.datum, tc.type, tc.omschrijving,
+           ta.speler, ta.status, tc.training_id
+    FROM trainings_calendar tc
+    LEFT JOIN training_attendance ta ON tc.training_id = ta.training_id
+    ORDER BY tc.datum DESC
+""")
+
+if attendance_data:
+    # Groepeer per training
+    trainings_dict = {}
+    for row in attendance_data:
+        datum, type_tr, omschrijving, speler, status, training_id = row
+        
+        if training_id not in trainings_dict:
+            trainings_dict[training_id] = {
+                'datum': datum,
+                'type': type_tr,
+                'omschrijving': omschrijving,
+                'spelers': []
+            }
+        
+        if speler:  # Only add if player exists
+            trainings_dict[training_id]['spelers'].append({
+                'speler': speler,
+                'status': status
+            })
+    
+    # Toon overzicht per training
+    for attendance_idx, (training_id, training_info) in enumerate(trainings_dict.items()):
+        datum_str = pd.to_datetime(training_info['datum']).date().strftime("%d/%m/%Y")
+        
+        # Bereken aanwezigheid
+        if training_info['spelers']:
+            aanwezig = len([s for s in training_info['spelers'] if s['status'] == 'Aanwezig'])
+            totaal = len(training_info['spelers'])
+            percentage = (aanwezig / totaal * 100) if totaal > 0 else 0
+            
+            with st.expander(f"{training_info['type']} - {datum_str} ({aanwezig}/{totaal} - {percentage:.0f}%)"):
+                st.write(f"**Omschrijving:** {training_info['omschrijving'] if training_info['omschrijving'] else 'Geen omschrijving'}")
+                
+                # Aanwezige spelers
+                aanwezige = [s['speler'] for s in training_info['spelers'] if s['status'] == 'Aanwezig']
+                afwezige = [s['speler'] for s in training_info['spelers'] if s['status'] == 'Afwezig']
+                
+                if aanwezige:
+                    st.success(f"✅ **Aanwezig ({len(aanwezige)}):** {', '.join(aanwezige)}")
+                
+                if afwezige:
+                    st.error(f"❌ **Afwezig ({len(afwezige)}):** {', '.join(afwezige)}")
+                
+                # Koppeling naar training planning  
+                link_key = f"link_{training_id}_{attendance_idx}"
+                if st.button(f"🔗 Gebruik voor Training Planning", key=link_key):
+                    # Set session state voor de training planning tab
+                    aanwezige_spelers_voor_planning = aanwezige
+                    
+                    # Update de aanwezigheid checkboxes in de training planning
+                    for speler in aanwezige + afwezige:
+                        st.session_state[f"aanwezig_{speler}"] = speler in aanwezige_spelers_voor_planning
+                    
+                    st.success(f"✅ Aanwezigheid van {training_info['type']} op {datum_str} overgenomen naar Training Planning!")
+                    st.info("🔄 Ga naar het 'Training Planning' tabblad om de training te configureren met de geselecteerde spelers.")
+        else:
+            with st.expander(f"{training_info['type']} - {datum_str} (Geen aanwezigheid ingesteld)"):
+                st.write(f"**Omschrijving:** {training_info['omschrijving'] if training_info['omschrijving'] else 'Geen omschrijving'}")
+                st.info("ℹ️ Nog geen aanwezigheid ingesteld voor deze training.")
+else:
+    st.info("📭 Nog geen trainingen met aanwezigheidsgegevens")
+
+# Safe database connection cleanup
+
+# Database cleanup handled by Supabase helpers

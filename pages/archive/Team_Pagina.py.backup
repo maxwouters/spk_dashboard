@@ -1,0 +1,463 @@
+import streamlit as st
+import pandas as pd
+import duckdb
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+from datetime import datetime, timedelta
+import numpy as np
+
+from db_config import get_database_connection
+st.set_page_config(page_title="Team Overzicht - SPK Dashboard", layout="wide")
+
+# Custom CSS styling
+st.markdown("""
+<style>
+    .main-header {
+        background: linear-gradient(90deg, #2E86AB 0%, #A23B72 100%);
+        padding: 1rem;
+        border-radius: 10px;
+        margin-bottom: 2rem;
+        color: white;
+        text-align: center;
+    }
+    
+    .info-card {
+        background: linear-gradient(135deg, #FAFCFF 0%, #E8F4FD 100%);
+        padding: 1.5rem;
+        border-radius: 10px;
+        border-left: 4px solid #2E86AB;
+        margin: 1rem 0;
+        box-shadow: 0 2px 4px rgba(46, 134, 171, 0.1);
+    }
+    
+    .metric-card {
+        background: white;
+        padding: 1rem;
+        border-radius: 8px;
+        border: 1px solid #E8F4FD;
+        text-align: center;
+        margin: 0.5rem 0;
+        box-shadow: 0 2px 4px rgba(46, 134, 171, 0.05);
+    }
+    
+    .player-card {
+        background: linear-gradient(135deg, #F8FFFA 0%, #E8F5E8 100%);
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 3px solid #2E8B57;
+        margin: 0.5rem 0;
+    }
+    
+    .accent-blue { color: #2E86AB; font-weight: bold; }
+    .accent-purple { color: #A23B72; font-weight: bold; }
+    .accent-orange { color: #F18F01; font-weight: bold; }
+    .accent-green { color: #2E8B57; font-weight: bold; }
+</style>
+""", unsafe_allow_html=True)
+
+# Header
+st.markdown('<div class="main-header"><h1>👥 Team Overzicht</h1></div>', unsafe_allow_html=True)
+
+# Database connectie
+con = get_database_connection()
+
+# ==================== TEAM STATISTIEKEN ====================
+st.markdown('<div class="info-card">', unsafe_allow_html=True)
+st.markdown("### <span class='accent-blue'>📊 Team Statistieken</span>", unsafe_allow_html=True)
+
+col1, col2, col3, col4 = st.columns(4)
+
+# Totaal aantal spelers
+try:
+    alle_spelers = con.execute("""
+        SELECT DISTINCT speler FROM (
+            SELECT Speler as speler FROM thirty_fifteen_results WHERE Speler IS NOT NULL
+            UNION 
+            SELECT speler FROM gps_data WHERE speler IS NOT NULL
+            UNION
+            SELECT speler FROM training_attendance WHERE speler IS NOT NULL
+        ) 
+        ORDER BY speler
+    """).fetchall()
+    
+    totaal_spelers = len(alle_spelers)
+    
+    with col1:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        st.metric("👥 Totaal Spelers", totaal_spelers)
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+except Exception as e:
+    with col1:
+        st.error(f"Fout bij ophalen spelers: {e}")
+
+# Laatste 30-15 test statistieken
+try:
+    latest_tests = con.execute("""
+        SELECT COUNT(*) as aantal, AVG(MAS) as gem_mas, AVG(VO2MAX) as gem_vo2
+        FROM thirty_fifteen_results 
+        WHERE Maand = (SELECT MAX(Maand) FROM thirty_fifteen_results)
+    """).fetchone()
+    
+    with col2:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        st.metric("🧪 Laatste Tests", latest_tests[0] if latest_tests else 0)
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    with col3:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        st.metric("🏃‍♂️ Team MAS", f"{latest_tests[1]:.1f} km/u" if latest_tests and latest_tests[1] else "N/A")
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    with col4:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        st.metric("🫁 Team VO2Max", f"{latest_tests[2]:.1f}" if latest_tests and latest_tests[2] else "N/A")
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+except Exception as e:
+    st.error(f"Fout bij 30-15 statistieken: {e}")
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+# ==================== INDIVIDUELE PRESTATIES ====================
+col_left, col_right = st.columns([2, 1])
+
+with col_left:
+    st.markdown('<div class="info-card">', unsafe_allow_html=True)
+    st.markdown("### <span class='accent-purple'>📈 Individuele Prestaties</span>", unsafe_allow_html=True)
+    
+    # Haal laatste 30-15 resultaten op
+    try:
+        resultaten = con.execute("""
+            SELECT Speler, MAS, VO2MAX, Maand, Leeftijd
+            FROM thirty_fifteen_results
+            WHERE Maand = (SELECT MAX(Maand) FROM thirty_fifteen_results)
+            ORDER BY MAS DESC
+        """).fetchall()
+        
+        if resultaten:
+            df_resultaten = pd.DataFrame(resultaten, columns=['Speler', 'MAS', 'VO2MAX', 'Maand', 'Leeftijd'])
+            
+            # Interactieve scatter plot
+            fig = px.scatter(df_resultaten, 
+                           x='MAS', y='VO2MAX', 
+                           hover_data=['Speler', 'Leeftijd'],
+                           color='Leeftijd',
+                           size='MAS',
+                           title="MAS vs VO2Max per Speler",
+                           color_continuous_scale='Viridis')
+            
+            fig.update_traces(
+                hovertemplate="<b>%{customdata[0]}</b><br>" +
+                             "MAS: %{x:.1f} km/u<br>" +
+                             "VO2Max: %{y:.1f}<br>" +
+                             "Leeftijd: %{customdata[1]} jaar<br>" +
+                             "<extra></extra>"
+            )
+            
+            fig.update_layout(
+                height=400,
+                xaxis_title="MAS (km/u)",
+                yaxis_title="VO2Max (ml/kg/min)"
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Top performers
+            st.markdown("#### 🏆 Top 5 MAS Prestaties")
+            top_5 = df_resultaten.head(5)
+            
+            for idx, (_, row) in enumerate(top_5.iterrows(), 1):
+                medal = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"][idx-1]
+                st.markdown(f"""
+                <div class="player-card">
+                    <strong>{medal} {row['Speler']}</strong><br>
+                    MAS: {row['MAS']:.1f} km/u | VO2Max: {row['VO2MAX']:.1f} | Leeftijd: {row['Leeftijd']}
+                </div>
+                """, unsafe_allow_html=True)
+                
+        else:
+            st.info("📭 Geen 30-15 testresultaten beschikbaar")
+            
+    except Exception as e:
+        st.error(f"Fout bij ophalen prestaties: {e}")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with col_right:
+    st.markdown('<div class="info-card">', unsafe_allow_html=True)
+    st.markdown("### <span class='accent-orange'>📊 Team Verdeling</span>", unsafe_allow_html=True)
+    
+    # Leeftijdsverdeling
+    try:
+        if 'df_resultaten' in locals() and not df_resultaten.empty:
+            # Leeftijd histogram
+            fig_leeftijd = px.histogram(df_resultaten, 
+                                      x='Leeftijd', 
+                                      title="Leeftijdsverdeling",
+                                      nbins=8,
+                                      color_discrete_sequence=['#2E86AB'])
+            
+            fig_leeftijd.update_layout(
+                height=250,
+                showlegend=False,
+                xaxis_title="Leeftijd (jaar)",
+                yaxis_title="Aantal Spelers"
+            )
+            
+            st.plotly_chart(fig_leeftijd, use_container_width=True)
+            
+            # Statistieken
+            st.markdown("#### 📊 Team Stats")
+            st.metric("👶 Jongste Speler", f"{df_resultaten['Leeftijd'].min()} jaar")
+            st.metric("👴 Oudste Speler", f"{df_resultaten['Leeftijd'].max()} jaar") 
+            st.metric("🎯 Gemiddelde Leeftijd", f"{df_resultaten['Leeftijd'].mean():.1f} jaar")
+            
+    except Exception as e:
+        st.error(f"Fout bij leeftijdsverdeling: {e}")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# ==================== GPS PRESTATIES ====================
+st.markdown('<div class="info-card">', unsafe_allow_html=True)
+st.markdown("### <span class='accent-green'>🏃‍♂️ GPS Training Prestaties</span>", unsafe_allow_html=True)
+
+try:
+    gps_data = con.execute("""
+        SELECT speler, datum, totale_afstand, hoge_intensiteit_afstand, max_snelheid, aantal_sprints
+        FROM gps_data
+        ORDER BY datum DESC
+        LIMIT 50
+    """).fetchall()
+    
+    if gps_data:
+        df_gps = pd.DataFrame(gps_data, columns=['Speler', 'Datum', 'Totale_Afstand', 'HSR', 'Max_Speed', 'Sprints'])
+        df_gps['Datum'] = pd.to_datetime(df_gps['Datum'])
+        
+        # GPS Metrics in 4 kolommen
+        gps_col1, gps_col2, gps_col3, gps_col4 = st.columns(4)
+        
+        with gps_col1:
+            avg_distance = df_gps['Totale_Afstand'].mean()
+            st.metric("🏃 Gem. Totale Afstand", f"{avg_distance:.0f}m")
+        
+        with gps_col2:
+            avg_hsr = df_gps['HSR'].mean()
+            st.metric("⚡ Gem. High Speed", f"{avg_hsr:.0f}m")
+        
+        with gps_col3:
+            max_speed = df_gps['Max_Speed'].max()
+            st.metric("🚀 Hoogste Snelheid", f"{max_speed:.1f} km/u")
+        
+        with gps_col4:
+            avg_sprints = df_gps['Sprints'].mean()
+            st.metric("💨 Gem. Sprints", f"{avg_sprints:.0f}")
+        
+        # GPS Trends
+        col_gps1, col_gps2 = st.columns(2)
+        
+        with col_gps1:
+            # Gemiddelde prestaties per speler
+            speler_avg = df_gps.groupby('Speler').agg({
+                'Totale_Afstand': 'mean',
+                'HSR': 'mean',
+                'Max_Speed': 'max'
+            }).reset_index()
+            
+            fig_gps_bar = px.bar(speler_avg.head(10), 
+                               x='Speler', y='Totale_Afstand',
+                               title="Gemiddelde Totale Afstand per Speler",
+                               color='HSR',
+                               color_continuous_scale='Blues')
+            
+            fig_gps_bar.update_layout(height=350)
+            fig_gps_bar.update_xaxis(tickangle=45)
+            st.plotly_chart(fig_gps_bar, use_container_width=True)
+        
+        with col_gps2:
+            # Max snelheid vs HSR
+            fig_speed_hsr = px.scatter(df_gps, 
+                                     x='Max_Speed', y='HSR',
+                                     color='Speler',
+                                     title="Max Snelheid vs High Speed Running",
+                                     hover_data=['Speler', 'Datum'])
+            
+            fig_speed_hsr.update_layout(height=350, showlegend=False)
+            st.plotly_chart(fig_speed_hsr, use_container_width=True)
+            
+    else:
+        st.info("📭 Geen GPS data beschikbaar")
+        
+except Exception as e:
+    st.error(f"Fout bij GPS data: {e}")
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+# ==================== AANWEZIGHEID & ACTIVITEIT ====================
+st.markdown('<div class="info-card">', unsafe_allow_html=True)
+st.markdown("### <span class='accent-blue'>📅 Aanwezigheid & Activiteit</span>", unsafe_allow_html=True)
+
+try:
+    # Recente aanwezigheid
+    aanwezigheid = con.execute("""
+        SELECT tc.datum, tc.type, COUNT(ta.speler) as totaal_spelers,
+               SUM(CASE WHEN ta.status = 'Aanwezig' THEN 1 ELSE 0 END) as aanwezig
+        FROM trainings_calendar tc
+        LEFT JOIN training_attendance ta ON tc.training_id = ta.training_id
+        WHERE tc.datum >= ?
+        GROUP BY tc.datum, tc.type, tc.training_id
+        ORDER BY tc.datum DESC
+        LIMIT 10
+    """, (datetime.now().date() - timedelta(days=30),)).fetchall()
+    
+    if aanwezigheid:
+        df_aanwezigheid = pd.DataFrame(aanwezigheid, columns=['Datum', 'Type', 'Totaal', 'Aanwezig'])
+        df_aanwezigheid['Percentage'] = (df_aanwezigheid['Aanwezig'] / df_aanwezigheid['Totaal'] * 100).fillna(0)
+        df_aanwezigheid['Datum'] = pd.to_datetime(df_aanwezigheid['Datum'])
+        
+        col_att1, col_att2 = st.columns(2)
+        
+        with col_att1:
+            # Aanwezigheid trend
+            fig_attendance = px.line(df_aanwezigheid, 
+                                   x='Datum', y='Percentage',
+                                   title="Aanwezigheidspercentage Trend",
+                                   markers=True,
+                                   color_discrete_sequence=['#2E86AB'])
+            
+            fig_attendance.update_layout(
+                height=300,
+                yaxis_title="Aanwezigheid (%)",
+                yaxis_range=[0, 100]
+            )
+            
+            st.plotly_chart(fig_attendance, use_container_width=True)
+        
+        with col_att2:
+            # Training types
+            type_counts = df_aanwezigheid['Type'].value_counts()
+            
+            fig_types = px.pie(values=type_counts.values, 
+                             names=type_counts.index,
+                             title="Verdeling Trainingstypen",
+                             color_discrete_sequence=px.colors.qualitative.Set3)
+            
+            fig_types.update_layout(height=300)
+            st.plotly_chart(fig_types, use_container_width=True)
+        
+        # Aanwezigheid statistieken
+        col_stat1, col_stat2, col_stat3 = st.columns(3)
+        
+        with col_stat1:
+            gem_aanwezigheid = df_aanwezigheid['Percentage'].mean()
+            st.metric("📊 Gem. Aanwezigheid", f"{gem_aanwezigheid:.0f}%")
+        
+        with col_stat2:
+            laatste_training = df_aanwezigheid.iloc[0]
+            st.metric("📅 Laatste Training", f"{laatste_training['Aanwezig']}/{laatste_training['Totaal']}")
+        
+        with col_stat3:
+            totaal_sessies = len(df_aanwezigheid)
+            st.metric("🏃 Totaal Sessies", totaal_sessies)
+    
+    else:
+        st.info("📭 Geen aanwezigheidsdata beschikbaar")
+        
+except Exception as e:
+    st.error(f"Fout bij aanwezigheidsdata: {e}")
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+# ==================== QUICK INSIGHTS ====================
+st.markdown('<div class="info-card">', unsafe_allow_html=True)
+st.markdown("### <span class='accent-orange'>💡 Team Insights</span>", unsafe_allow_html=True)
+
+insights_col1, insights_col2 = st.columns(2)
+
+with insights_col1:
+    st.markdown("#### 🎯 Sterke Punten")
+    
+    try:
+        # Beste performers identificeren
+        if 'df_resultaten' in locals() and not df_resultaten.empty:
+            beste_mas = df_resultaten.loc[df_resultaten['MAS'].idxmax()]
+            beste_vo2 = df_resultaten.loc[df_resultaten['VO2MAX'].idxmax()]
+            
+            st.success(f"🏃‍♂️ Beste MAS: **{beste_mas['Speler']}** ({beste_mas['MAS']:.1f} km/u)")
+            st.success(f"🫁 Beste VO2Max: **{beste_vo2['Speler']}** ({beste_vo2['VO2MAX']:.1f})")
+            
+            # Team gemiddelden vs normwaarden
+            team_mas_avg = df_resultaten['MAS'].mean()
+            if team_mas_avg > 16.0:  # Goede normwaarde voor voetbal
+                st.success(f"⭐ Team MAS boven gemiddelde: {team_mas_avg:.1f} km/u")
+            
+    except Exception as e:
+        st.error(f"Fout bij sterke punten: {e}")
+
+with insights_col2:
+    st.markdown("#### 🔧 Aandachtspunten")
+    
+    try:
+        if 'df_resultaten' in locals() and not df_resultaten.empty:
+            # Identificeer spelers die mogelijk extra aandacht nodig hebben
+            laagste_mas = df_resultaten.loc[df_resultaten['MAS'].idxmin()]
+            
+            st.warning(f"📉 Laagste MAS: **{laagste_mas['Speler']}** ({laagste_mas['MAS']:.1f} km/u)")
+            
+            # Spreiding in team
+            mas_std = df_resultaten['MAS'].std()
+            if mas_std > 2.0:  # Grote spreiding
+                st.warning(f"📊 Grote spreiding in team: {mas_std:.1f} km/u")
+            
+            # Aanwezigheid
+            if 'df_aanwezigheid' in locals() and not df_aanwezigheid.empty:
+                if df_aanwezigheid['Percentage'].mean() < 80:
+                    st.warning("📅 Aanwezigheid kan beter (< 80%)")
+            
+    except Exception as e:
+        st.error(f"Fout bij aandachtspunten: {e}")
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+# Export optie
+st.markdown("---")
+col_export1, col_export2, col_export3 = st.columns([1, 1, 2])
+
+with col_export1:
+    if st.button("📊 Exporteer Team Data"):
+        try:
+            # Combineer alle relevante data
+            export_data = []
+            
+            # Voeg 30-15 data toe
+            if 'df_resultaten' in locals():
+                for _, row in df_resultaten.iterrows():
+                    export_data.append({
+                        'Speler': row['Speler'],
+                        'Type': '30-15 Test',
+                        'MAS': row['MAS'],
+                        'VO2Max': row['VO2MAX'],
+                        'Leeftijd': row['Leeftijd'],
+                        'Datum': row['Maand']
+                    })
+            
+            if export_data:
+                df_export = pd.DataFrame(export_data)
+                csv_data = df_export.to_csv(index=False)
+                
+                st.download_button(
+                    label="📥 Download CSV",
+                    data=csv_data,
+                    file_name=f"team_overzicht_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv"
+                )
+                
+        except Exception as e:
+            st.error(f"Fout bij export: {e}")
+
+with col_export2:
+    st.info("💡 **Tip:** Gebruik dit overzicht voor team briefings en planning")
+
+# Database sluiten
+con.close()

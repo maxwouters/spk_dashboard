@@ -1,0 +1,992 @@
+import streamlit as st
+
+# Supabase helpers (primary)
+try:
+    from supabase_helpers import (
+        get_table_data, 
+        get_thirty_fifteen_results, 
+        get_cached_player_list,
+        test_supabase_connection,
+        safe_fetchdf,
+        check_table_exists
+    )
+    SUPABASE_MODE = True
+except ImportError:
+    # Fallback to legacy
+    from db_config import get_database_connection
+    from database_helpers import check_table_exists, get_table_columns, add_column_if_not_exists, safe_fetchdf
+    SUPABASE_MODE = False
+import pandas as pd
+from datetime import datetime, timedelta, date
+import plotly.express as px
+import plotly.graph_objects as go
+import json
+
+
+# Database compatibility functions
+def execute_db_query(query, params=None):
+    """Execute query and return results compatible with both databases"""
+    if SUPABASE_MODE:
+        try:
+            df = safe_fetchdf(query, params or {})
+            if df.empty:
+                return []
+            # Convert DataFrame to list of tuples (like fetchall())
+            return [tuple(row) for row in df.values]
+        except Exception as e:
+            st.error(f"Query failed: {e}")
+            return []
+    else:
+        # Legacy mode
+        try:
+            if params:
+                return execute_db_query(query, params)
+            else:
+                return execute_db_query(query)
+        except Exception as e:
+            st.error(f"Legacy query failed: {e}")
+            return []
+
+def get_supabase_data(table_name, columns="*", where_conditions=None):
+    """Get data using Supabase helpers"""
+    if SUPABASE_MODE:
+        return get_table_data(table_name, columns, where_conditions)
+    else:
+        # Legacy fallback
+        query = f"SELECT {columns} FROM {table_name}"
+        if where_conditions:
+            conditions = [f"{k} = '{v}'" for k, v in where_conditions.items()]
+            query += f" WHERE {' AND '.join(conditions)}"
+        return safe_fetchdf(query)
+
+st.set_page_config(page_title="SPK Dashboard - Coaching Tools", layout="wide")
+
+st.subheader("🧰 Coaching Tools & Session Planning")
+
+# Database setup
+if SUPABASE_MODE:
+    st.info("🌐 Using Supabase database")
+    if not test_supabase_connection():
+        st.error("❌ Cannot connect to Supabase")
+        st.stop()
+    con = None  # Will use Supabase helpers
+else:
+    # Legacy mode
+    # Legacy mode fallback
+    try:
+        con = get_database_connection()
+    except NameError:
+        st.error("❌ Database connection not available")
+        st.stop()
+# Database tabellen voor coaching tools
+execute_db_query("""
+    CREATE TABLE IF NOT EXISTS drill_library (
+        drill_id INTEGER PRIMARY KEY,
+        naam TEXT,
+        categorie TEXT,  -- Techniek, Tactiek, Fysiek, Spelvormen, Opwarming, Cooling_down
+        focus_fase TEXT,  -- Aanval, Verdediging, Omschakeling, Algemeen
+        spelers_min INTEGER,
+        spelers_max INTEGER,
+        duur_minuten INTEGER,
+        intensiteit_niveau INTEGER,  -- 1-10 schaal
+        materiaal TEXT,
+        veld_afmetingen TEXT,
+        beschrijving TEXT,
+        instructies TEXT,
+        coaching_punten TEXT,
+        variaties TEXT,
+        afbeelding_url TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+execute_db_query("""
+    CREATE TABLE IF NOT EXISTS session_plans (
+        session_id INTEGER PRIMARY KEY,
+        training_id INTEGER,
+        naam TEXT,
+        datum DATE,
+        duur_totaal INTEGER,
+        focus_themas TEXT,
+        doelgroep TEXT,
+        spelers_aantal INTEGER,
+        intensiteit_gemiddeld REAL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (training_id) REFERENCES trainings_calendar(training_id)
+    )
+""")
+
+execute_db_query("""
+    CREATE TABLE IF NOT EXISTS session_drills (
+        session_drill_id INTEGER PRIMARY KEY,
+        session_id INTEGER,
+        drill_id INTEGER,
+        volgorde INTEGER,
+        start_minuut INTEGER,
+        duur_minuten INTEGER,
+        aangepaste_instructies TEXT,
+        coaching_focus TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (session_id) REFERENCES session_plans(session_id),
+        FOREIGN KEY (drill_id) REFERENCES drill_library(drill_id)
+    )
+""")
+
+execute_db_query("""
+    CREATE TABLE IF NOT EXISTS session_templates (
+        template_id INTEGER PRIMARY KEY,
+        naam TEXT,
+        type_training TEXT,  -- Techniek, Fysiek, Tactiek, Wedstrijd_prep, Recovery
+        duur_minuten INTEGER,
+        beschrijving TEXT,
+        template_data TEXT,  -- JSON met drill structuur
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+# Sequences maken
+try:
+    execute_db_query("CREATE SEQUENCE IF NOT EXISTS drill_id_seq START 1")
+    execute_db_query("CREATE SEQUENCE IF NOT EXISTS session_id_seq START 1")
+    execute_db_query("CREATE SEQUENCE IF NOT EXISTS session_drill_id_seq START 1")
+    execute_db_query("CREATE SEQUENCE IF NOT EXISTS template_id_seq START 1")
+except:
+    pass
+
+# Helper functies
+def create_default_drills():
+    """Creëer standaard drill library"""
+    drills = [
+        {
+            'naam': 'Passing in Vierkant',
+            'categorie': 'Techniek',
+            'focus_fase': 'Algemeen',
+            'spelers_min': 8, 'spelers_max': 16,
+            'duur_minuten': 15,
+            'intensiteit_niveau': 4,
+            'materiaal': '4 pionnen, 2 ballen',
+            'veld_afmetingen': '15x15 meter',
+            'beschrijving': 'Basis passing oefening in vierkant met variaties',
+            'instructies': '1. Spelers op 4 hoeken\n2. Pass naar rechts\n3. Loop naar positie waar je passte\n4. Tempo opbouwen',
+            'coaching_punten': '- Kwaliteit voor snelheid\n- Eerste aanraking\n- Communicatie\n- Lichaamhouding',
+            'variaties': '- 2 ballen tegelijk\n- Verschillende pass types\n- Onder druk\n- Ogen dicht ontvangen'
+        },
+        {
+            'naam': '3v1 Bezit Houden',
+            'categorie': 'Tactiek',
+            'focus_fase': 'Aanval',
+            'spelers_min': 4, 'spelers_max': 12,
+            'duur_minuten': 12,
+            'intensiteit_niveau': 6,
+            'materiaal': '4 pionnen, 1 bal',
+            'veld_afmetingen': '10x10 meter',
+            'beschrijving': '3 spelers houden bal in bezit tegen 1 verdediger',
+            'instructies': '1. 3 spelers in bezit\n2. 1 verdediger probeert bal te winnen\n3. 10 passes = punt\n4. Wissel rollen',
+            'coaching_punten': '- Speelhoeken creëren\n- Snelheid van spelen\n- Derde man\n- Lichaamsorientatie',
+            'variaties': '- 4v2 in groter veld\n- Met doeltjes\n- Tijd druk\n- Alleen 1-touch'
+        },
+        {
+            'naam': 'Sprint Intervaltraining',
+            'categorie': 'Fysiek',
+            'focus_fase': 'Algemeen',
+            'spelers_min': 8, 'spelers_max': 20,
+            'duur_minuten': 20,
+            'intensiteit_niveau': 9,
+            'materiaal': '8 pionnen, stopwatch',
+            'veld_afmetingen': '30 meter lijn',
+            'beschrijving': 'Hoge intensiteit sprint intervallen met rust',
+            'instructies': '1. 30 meter sprint\n2. 90 seconden rust\n3. 6 herhalingen\n4. 2 series',
+            'coaching_punten': '- Maximale intensiteit\n- Goede start techniek\n- Volledige rust\n- Mentale focus',
+            'variaties': '- Verschillende afstanden\n- Met bal\n- Richting veranderingen\n- Start vanuit verschillende posities'
+        },
+        {
+            'naam': 'Verdedigen 1v1',
+            'categorie': 'Tactiek',
+            'focus_fase': 'Verdediging',
+            'spelers_min': 6, 'spelers_max': 16,
+            'duur_minuten': 15,
+            'intensiteit_niveau': 7,
+            'materiaal': '2 kleine doelen, ballen',
+            'veld_afmetingen': '20x15 meter',
+            'beschrijving': '1v1 situaties met focus op verdedigende principes',
+            'instructies': '1. Aanvaller start met bal\n2. Verdediger 5 meter afstand\n3. Aanvaller probeert te scoren\n4. Verdediger wint bal of voorkomt doelpunt',
+            'coaching_punten': '- Afstand houden\n- Geduldig verdedigen\n- Niet in duel\n- Lichaam tussen bal en doel',
+            'variaties': '- 2v1\n- Met keeper\n- Verschillende hoeken\n- Tijd limiet'
+        },
+        {
+            'naam': 'Dynamische Opwarming',
+            'categorie': 'Opwarming',
+            'focus_fase': 'Algemeen',
+            'spelers_min': 8, 'spelers_max': 25,
+            'duur_minuten': 12,
+            'intensiteit_niveau': 5,
+            'materiaal': 'Pionnen, 1 bal per speler',
+            'veld_afmetingen': '30x20 meter',
+            'beschrijving': 'Progressieve opwarming met bal en beweging',
+            'instructies': '1. Vrij dribbelen (5 min)\n2. Strekken en rekken (3 min)\n3. Versnellingen (4 min)',
+            'coaching_punten': '- Geleidelijke opbouw\n- Alle gewrichten\n- Spier activatie\n- Mentale voorbereiding',
+            'variaties': '- Met partner oefeningen\n- Zonder bal\n- Spel elementen\n- Competitie element'
+        },
+        {
+            'naam': '4v4+4 Bezitsspel',
+            'categorie': 'Spelvormen',
+            'focus_fase': 'Aanval',
+            'spelers_min': 12, 'spelers_max': 16,
+            'duur_minuten': 20,
+            'intensiteit_niveau': 8,
+            'materiaal': '1 bal, hesjes, pionnen',
+            'veld_afmetingen': '25x25 meter',
+            'beschrijving': '4v4 met neutrale spelers op de lijn',
+            'instructies': '1. 4v4 in het veld\n2. 4 neutrale spelers op lijnen\n3. 8 passes = 1 punt\n4. Neutraal speelt altijd mee',
+            'coaching_punten': '- Breedte gebruiken\n- Snelheid van spelen\n- Switchen van spel\n- Positiespel',
+            'variaties': '- Verschillende veldsizes\n- 5v5+5\n- Met doelen\n- Tijd druk'
+        }
+    ]
+    
+    # Check of drills al bestaan
+    existing = (lambda result: result[0] if result else None)(execute_db_query("SELECT COUNT(*) FROM drill_library"))[0]
+    
+    if existing == 0:
+        for drill in drills:
+            execute_db_query("""
+                INSERT INTO drill_library 
+                (drill_id, naam, categorie, focus_fase, spelers_min, spelers_max, 
+                 duur_minuten, intensiteit_niveau, materiaal, veld_afmetingen,
+                 beschrijving, instructies, coaching_punten, variaties)
+                VALUES (nextval('drill_id_seq'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (drill['naam'], drill['categorie'], drill['focus_fase'],
+                  drill['spelers_min'], drill['spelers_max'], drill['duur_minuten'],
+                  drill['intensiteit_niveau'], drill['materiaal'], drill['veld_afmetingen'],
+                  drill['beschrijving'], drill['instructies'], drill['coaching_punten'],
+                  drill['variaties']))
+
+def create_session_from_template(template_data, training_id, naam, datum):
+    """Creëer een session op basis van template"""
+    # Parse template data (JSON)
+    template = json.loads(template_data)
+    
+    # Creëer session
+    session_id = execute_db_query("""
+        INSERT INTO session_plans 
+        (session_id, training_id, naam, datum, duur_totaal, focus_themas, 
+         doelgroep, spelers_aantal, intensiteit_gemiddeld)
+        VALUES (nextval('session_id_seq'), ?, ?, ?, ?, ?, ?, ?, ?)
+        RETURNING session_id
+    """, (training_id, naam, datum, template['duur_totaal'],
+          template['focus_themas'], template['doelgroep'], 
+          template['spelers_aantal'], template['intensiteit_gemiddeld']))[0]
+    
+    # Voeg drills toe
+    for drill_info in template['drills']:
+        execute_db_query("""
+            INSERT INTO session_drills
+            (session_drill_id, session_id, drill_id, volgorde, start_minuut, 
+             duur_minuten, coaching_focus)
+            VALUES (nextval('session_drill_id_seq'), ?, ?, ?, ?, ?, ?)
+        """, (session_id, drill_info['drill_id'], drill_info['volgorde'],
+              drill_info['start_minuut'], drill_info['duur_minuten'], drill_info['coaching_focus']))
+    
+    return session_id
+
+# Initialiseer drill library
+create_default_drills()
+
+# Tabs voor verschillende coaching tools
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📚 Drill Library", 
+    "📋 Session Planning", 
+    "🎯 Session Templates",
+    "📊 Training Analysis",
+    "⚙️ Drill Management",
+    "📝 Thema's Bijwerken"
+])
+
+with tab1:
+    st.markdown("### 📚 Drill Library")
+    
+    # Filters
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        categorie_filter = st.selectbox("📂 Categorie", 
+                                      ["Alle", "Techniek", "Tactiek", "Fysiek", "Spelvormen", "Opwarming", "Cooling_down"])
+    
+    with col2:
+        fase_filter = st.selectbox("⚽ Fase", 
+                                 ["Alle", "Aanval", "Verdediging", "Omschakeling", "Algemeen"])
+    
+    with col3:
+        intensiteit_filter = st.slider("⚡ Max Intensiteit", 1, 10, 10)
+    
+    # Search
+    search_term = st.text_input("🔍 Zoek drill", placeholder="Zoek op naam of beschrijving...")
+    
+    # Haal drills op met filters
+    where_clauses = []
+    params = []
+    
+    if categorie_filter != "Alle":
+        where_clauses.append("categorie = ?")
+        params.append(categorie_filter)
+    
+    if fase_filter != "Alle":
+        where_clauses.append("focus_fase = ?")
+        params.append(fase_filter)
+    
+    where_clauses.append("intensiteit_niveau <= ?")
+    params.append(intensiteit_filter)
+    
+    if search_term:
+        where_clauses.append("(LOWER(naam) LIKE ? OR LOWER(beschrijving) LIKE ?)")
+        search_pattern = f"%{search_term.lower()}%"
+        params.extend([search_pattern, search_pattern])
+    
+    where_clause = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+    
+    drills = execute_db_query(f"""
+        SELECT drill_id, naam, categorie, focus_fase, spelers_min, spelers_max,
+               duur_minuten, intensiteit_niveau, materiaal, veld_afmetingen,
+               beschrijving, instructies, coaching_punten, variaties
+        FROM drill_library
+        {where_clause}
+        ORDER BY categorie, naam
+    """, params)
+    
+    if drills:
+        st.write(f"📋 **{len(drills)} drills gevonden**")
+        
+        # Drill showcase
+        for drill in drills:
+            drill_id, naam, categorie, focus_fase, spelers_min, spelers_max, duur_minuten, intensiteit_niveau, materiaal, veld_afmetingen, beschrijving, instructies, coaching_punten, variaties = drill
+            
+            # Intensiteit kleur
+            if intensiteit_niveau <= 3:
+                intensity_color = "#2ECC71"  # Groen
+            elif intensiteit_niveau <= 6:
+                intensity_color = "#F39C12"  # Oranje
+            else:
+                intensity_color = "#E74C3C"  # Rood
+            
+            with st.expander(f"🏃 {naam} | {categorie} | {focus_fase} | {duur_minuten}min"):
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    st.markdown(f"**📋 Beschrijving:** {beschrijving}")
+                    st.markdown(f"**👥 Spelers:** {spelers_min}-{spelers_max}")
+                    st.markdown(f"**📐 Veld:** {veld_afmetingen}")
+                    st.markdown(f"**🎒 Materiaal:** {materiaal}")
+                    
+                    # Intensiteit indicator
+                    st.markdown(f"""
+                    <div style='display: inline-block; padding: 5px 10px; border-radius: 15px; 
+                                background-color: {intensity_color}20; border: 2px solid {intensity_color};'>
+                        <strong>⚡ Intensiteit: {intensiteit_niveau}/10</strong>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with col2:
+                    if st.button("➕ Toevoegen aan Session", key=f"add_drill_{drill_id}"):
+                        if 'session_drills' not in st.session_state:
+                            st.session_state.session_drills = []
+                        
+                        drill_info = {
+                            'drill_id': drill_id,
+                            'naam': naam,
+                            'duur_minuten': duur_minuten,
+                            'intensiteit': intensiteit_niveau
+                        }
+                        st.session_state.session_drills.append(drill_info)
+                        st.success(f"✅ {naam} toegevoegd aan session!")
+                
+                # Tabs voor detail informatie
+                detail_tab1, detail_tab2, detail_tab3 = st.tabs(["📝 Instructies", "🎯 Coaching Punten", "🔄 Variaties"])
+                
+                with detail_tab1:
+                    st.markdown(instructies)
+                
+                with detail_tab2:
+                    st.markdown(coaching_punten)
+                
+                with detail_tab3:
+                    st.markdown(variaties)
+    else:
+        st.info("📭 Geen drills gevonden met de huidige filters")
+
+with tab2:
+    st.markdown("### 📋 Session Planning")
+    
+    # Training selectie voor session planning
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("#### ➕ Nieuwe Session Plannen")
+        
+        # Selecteer training
+        upcoming_trainings = execute_db_query("""
+            SELECT training_id, datum, type, omschrijving 
+            FROM trainings_calendar 
+            WHERE datum >= CURRENT_DATE
+            ORDER BY datum
+            LIMIT 10
+        """)
+        
+        if upcoming_trainings:
+            training_options = {
+                f"{pd.to_datetime(t[1]).date().strftime('%d/%m/%Y')} - {t[2]} - {t[3] or 'Training'}": t[0] 
+                for t in upcoming_trainings
+            }
+            
+            selected_training_display = st.selectbox("🏃 Selecteer Training", list(training_options.keys()))
+            selected_training_id = training_options[selected_training_display]
+            
+            with st.form("nieuwe_session"):
+                session_naam = st.text_input("📝 Session Naam", 
+                                            placeholder="bijv. Techniek Training - Passing")
+                
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    focus_themas = st.text_input("🎯 Focus Themas", 
+                                               placeholder="bijv. Passing, 1v1, Afwerking")
+                    doelgroep = st.selectbox("👥 Doelgroep", 
+                                           ["Eerste Elftal", "Reserves", "Jeugd U19", "Jeugd U17", "Gemengd"])
+                
+                with col_b:
+                    spelers_aantal = st.number_input("👥 Aantal Spelers", min_value=8, max_value=25, value=16)
+                    session_datum = st.date_input("📅 Datum", value=datetime.now().date())
+                
+                submitted = st.form_submit_button("✅ Session Aanmaken")
+                
+                if submitted and session_naam:
+                    # Bereken totale duur en gemiddelde intensiteit van toegevoegde drills
+                    if 'session_drills' in st.session_state and st.session_state.session_drills:
+                        duur_totaal = sum(drill['duur_minuten'] for drill in st.session_state.session_drills)
+                        intensiteit_gemiddeld = sum(drill['intensiteit'] for drill in st.session_state.session_drills) / len(st.session_state.session_drills)
+                    else:
+                        duur_totaal = 90  # Default
+                        intensiteit_gemiddeld = 5
+                    
+                    # Creëer session
+                    session_id = execute_db_query("""
+                        INSERT INTO session_plans 
+                        (session_id, training_id, naam, datum, duur_totaal, focus_themas, 
+                         doelgroep, spelers_aantal, intensiteit_gemiddeld)
+                        VALUES (nextval('session_id_seq'), ?, ?, ?, ?, ?, ?, ?, ?)
+                        RETURNING session_id
+                    """, (selected_training_id, session_naam, session_datum, duur_totaal,
+                          focus_themas, doelgroep, spelers_aantal, intensiteit_gemiddeld))[0]
+                    
+                    # Voeg drills toe
+                    if 'session_drills' in st.session_state and st.session_state.session_drills:
+                        start_tijd = 0
+                        for i, drill_info in enumerate(st.session_state.session_drills):
+                            execute_db_query("""
+                                INSERT INTO session_drills
+                                (session_drill_id, session_id, drill_id, volgorde, start_minuut, 
+                                 duur_minuten, coaching_focus)
+                                VALUES (nextval('session_drill_id_seq'), ?, ?, ?, ?, ?, ?)
+                            """, (session_id, drill_info['drill_id'], i+1, start_tijd,
+                                  drill_info['duur_minuten'], f"Focus op {drill_info['naam']}"))
+                            
+                            start_tijd += drill_info['duur_minuten']
+                    
+                    st.success(f"✅ Session '{session_naam}' aangemaakt!")
+                    
+                    # Clear session drills
+                    if 'session_drills' in st.session_state:
+                        del st.session_state.session_drills
+                    
+                    st.rerun()
+        else:
+            st.warning("⚠️ Geen komende trainingen gevonden. Plan eerst trainingen in de kalender.")
+    
+    with col2:
+        st.markdown("#### 🗂️ Huidige Session")
+        
+        # Toon huidige session drills
+        if 'session_drills' in st.session_state and st.session_state.session_drills:
+            total_duration = sum(drill['duur_minuten'] for drill in st.session_state.session_drills)
+            avg_intensity = sum(drill['intensiteit'] for drill in st.session_state.session_drills) / len(st.session_state.session_drills)
+            
+            st.metric("⏱️ Totale Duur", f"{total_duration} minuten")
+            st.metric("⚡ Gem. Intensiteit", f"{avg_intensity:.1f}/10")
+            
+            st.markdown("**📋 Geselecteerde Drills:**")
+            
+            current_time = 0
+            for i, drill in enumerate(st.session_state.session_drills):
+                end_time = current_time + drill['duur_minuten']
+                
+                st.markdown(f"""
+                <div style='padding: 10px; margin: 5px 0; border-radius: 5px; 
+                            background-color: #f0f0f0; border-left: 4px solid #2E86AB;'>
+                    <strong>{i+1}. {drill['naam']}</strong><br>
+                    <small>⏱️ {current_time}-{end_time} min | ⚡ {drill['intensiteit']}/10</small>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                current_time = end_time
+            
+            if st.button("🗑️ Clear Alle Drills"):
+                del st.session_state.session_drills
+                st.rerun()
+        else:
+            st.info("📭 Nog geen drills toegevoegd. Ga naar de Drill Library om drills toe te voegen.")
+    
+    # Bestaande sessions tonen
+    st.markdown("#### 📚 Geplande Sessions")
+    
+    sessions = execute_db_query("""
+        SELECT sp.session_id, sp.naam, sp.datum, sp.duur_totaal, sp.focus_themas,
+               sp.doelgroep, sp.spelers_aantal, sp.intensiteit_gemiddeld,
+               tc.type as training_type
+        FROM session_plans sp
+        LEFT JOIN trainings_calendar tc ON sp.training_id = tc.training_id
+        WHERE sp.datum >= CURRENT_DATE - 7
+        ORDER BY sp.datum DESC
+    """)
+    
+    if sessions:
+        for session in sessions:
+            session_id, naam, datum, duur_totaal, focus_themas, doelgroep, spelers_aantal, intensiteit_gemiddeld, training_type = session
+            datum_str = pd.to_datetime(datum).date().strftime('%d/%m/%Y')
+            
+            with st.expander(f"📋 {naam} - {datum_str} ({duur_totaal} min)"):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write(f"**Focus:** {focus_themas}")
+                    st.write(f"**Doelgroep:** {doelgroep}")
+                    st.write(f"**Spelers:** {spelers_aantal}")
+                
+                with col2:
+                    st.write(f"**Training Type:** {training_type}")
+                    st.write(f"**Intensiteit:** {intensiteit_gemiddeld:.1f}/10")
+                
+                # Session drills
+                session_drills = execute_db_query("""
+                    SELECT sd.volgorde, dl.naam, sd.start_minuut, sd.duur_minuten,
+                           dl.intensiteit_niveau, sd.coaching_focus
+                    FROM session_drills sd
+                    JOIN drill_library dl ON sd.drill_id = dl.drill_id
+                    WHERE sd.session_id = ?
+                    ORDER BY sd.volgorde
+                """, (session_id,))
+                
+                if session_drills:
+                    st.markdown("**📋 Session Planning:**")
+                    for volgorde, drill_naam, start_min, duur_min, intensiteit, coaching_focus in session_drills:
+                        end_min = start_min + duur_min
+                        st.markdown(f"{volgorde}. **{drill_naam}** ({start_min}-{end_min} min) - Intensiteit: {intensiteit}/10")
+                        if coaching_focus:
+                            st.markdown(f"   *{coaching_focus}*")
+
+with tab3:
+    st.markdown("### 🎯 Session Templates")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("#### ➕ Nieuwe Template")
+        
+        with st.form("nieuwe_template"):
+            template_naam = st.text_input("📝 Template Naam")
+            template_type = st.selectbox("🏷️ Type Training", 
+                                       ["Techniek", "Fysiek", "Tactiek", "Wedstrijd_prep", "Recovery"])
+            template_beschrijving = st.text_area("📋 Beschrijving")
+            
+            submitted = st.form_submit_button("✅ Template Opslaan")
+            
+            if submitted and template_naam:
+                # Gebruik huidige session drills als template
+                if 'session_drills' in st.session_state and st.session_state.session_drills:
+                    template_data = {
+                        'duur_totaal': sum(drill['duur_minuten'] for drill in st.session_state.session_drills),
+                        'focus_themas': template_type,
+                        'doelgroep': 'Algemeen',
+                        'spelers_aantal': 16,
+                        'intensiteit_gemiddeld': sum(drill['intensiteit'] for drill in st.session_state.session_drills) / len(st.session_state.session_drills),
+                        'drills': []
+                    }
+                    
+                    start_tijd = 0
+                    for i, drill in enumerate(st.session_state.session_drills):
+                        template_data['drills'].append({
+                            'drill_id': drill['drill_id'],
+                            'volgorde': i+1,
+                            'start_minuut': start_tijd,
+                            'duur_minuten': drill['duur_minuten'],
+                            'coaching_focus': f"Focus op {drill['naam']}"
+                        })
+                        start_tijd += drill['duur_minuten']
+                    
+                    execute_db_query("""
+                        INSERT INTO session_templates 
+                        (template_id, naam, type_training, duur_minuten, beschrijving, template_data)
+                        VALUES (nextval('template_id_seq'), ?, ?, ?, ?, ?)
+                    """, (template_naam, template_type, template_data['duur_totaal'],
+                          template_beschrijving, json.dumps(template_data)))
+                    
+                    st.success(f"✅ Template '{template_naam}' opgeslagen!")
+                    st.rerun()
+                else:
+                    st.warning("⚠️ Voeg eerst drills toe aan je session voordat je een template maakt")
+    
+    with col2:
+        st.markdown("#### 📚 Bestaande Templates")
+        
+        templates = execute_db_query("""
+            SELECT template_id, naam, type_training, duur_minuten, beschrijving
+            FROM session_templates
+            ORDER BY type_training, naam
+        """)
+        
+        if templates:
+            for template in templates:
+                template_id, naam, type_training, duur_minuten, beschrijving = template
+                
+                with st.expander(f"📋 {naam} ({type_training}) - {duur_minuten} min"):
+                    st.write(f"**Type:** {type_training}")
+                    st.write(f"**Beschrijving:** {beschrijving}")
+                    
+                    col_i, col_ii = st.columns(2)
+                    
+                    with col_i:
+                        if st.button("📋 Gebruik Template", key=f"use_template_{template_id}"):
+                            # Haal template data op
+                            template_data = (lambda result: result[0] if result else None)(execute_db_query("""
+                                SELECT template_data FROM session_templates WHERE template_id = ?
+                            """, (template_id,)))[0]
+                            
+                            template_info = json.loads(template_data)
+                            
+                            # Zet drills in session state
+                            st.session_state.session_drills = []
+                            for drill_info in template_info['drills']:
+                                # Haal drill details op
+                                drill_details = (lambda result: result[0] if result else None)(execute_db_query("""
+                                    SELECT naam, duur_minuten, intensiteit_niveau
+                                    FROM drill_library WHERE drill_id = ?
+                                """, (drill_info['drill_id'],)))
+                                
+                                if drill_details:
+                                    naam, duur_min, intensiteit = drill_details
+                                    st.session_state.session_drills.append({
+                                        'drill_id': drill_info['drill_id'],
+                                        'naam': naam,
+                                        'duur_minuten': duur_min,
+                                        'intensiteit': intensiteit
+                                    })
+                            
+                            st.success(f"✅ Template '{naam}' geladen!")
+                            st.rerun()
+                    
+                    with col_ii:
+                        if st.button("🗑️ Verwijderen", key=f"del_template_{template_id}"):
+                            execute_db_query("DELETE FROM session_templates WHERE template_id = ?", (template_id,))
+                            st.rerun()
+        else:
+            st.info("📭 Nog geen templates aangemaakt")
+    
+    # Standaard templates showcasen
+    st.markdown("#### 💡 Aanbevolen Template Structuren")
+    
+    template_structures = {
+        "Techniek Training (90 min)": [
+            "Dynamische Opwarming (15 min)",
+            "Passing Techniek (20 min)", 
+            "1v1 Techniek (15 min)",
+            "Spelvormen met Techniek Focus (25 min)",
+            "Conditioneel Spel (10 min)",
+            "Cool Down (5 min)"
+        ],
+        "Fysiek Training (75 min)": [
+            "Opwarming (10 min)",
+            "Sprint Intervallen (20 min)",
+            "Kracht Circuit (15 min)",
+            "Aerobe Conditioning (20 min)",
+            "Cool Down (10 min)"
+        ],
+        "Tactiek Training (90 min)": [
+            "Opwarming (10 min)",
+            "Positiespel Klein (20 min)",
+            "Fase van het Spel (25 min)",
+            "11v11 Posities (25 min)",
+            "Cool Down (10 min)"
+        ]
+    }
+    
+    for template_name, structure in template_structures.items():
+        with st.expander(f"📖 {template_name}"):
+            for i, phase in enumerate(structure, 1):
+                st.write(f"{i}. {phase}")
+
+with tab4:
+    st.markdown("### 📊 Training Analysis")
+    
+    # Analyse van geplande sessions
+    analysis_period = st.selectbox("📅 Analyse Periode", 
+                                 ["Laatste 7 dagen", "Laatste 30 dagen", "Laatste 90 dagen"])
+    
+    if analysis_period == "Laatste 7 dagen":
+        days_back = 7
+    elif analysis_period == "Laatste 30 dagen":
+        days_back = 30
+    else:
+        days_back = 90
+    
+    start_date = datetime.now().date() - timedelta(days=days_back)
+    
+    # Session statistieken
+    session_stats = (lambda result: result[0] if result else None)(execute_db_query("""
+        SELECT 
+            COUNT(*) as total_sessions,
+            AVG(duur_totaal) as avg_duration,
+            AVG(intensiteit_gemiddeld) as avg_intensity,
+            AVG(spelers_aantal) as avg_players
+        FROM session_plans 
+        WHERE datum >= ?
+    """, (start_date,)))
+    
+    if session_stats and session_stats[0] > 0:
+        total_sessions, avg_duration, avg_intensity, avg_players = session_stats
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("📋 Totaal Sessions", int(total_sessions))
+        with col2:
+            st.metric("⏱️ Gem. Duur", f"{avg_duration:.0f} min")
+        with col3:
+            st.metric("⚡ Gem. Intensiteit", f"{avg_intensity:.1f}/10")
+        with col4:
+            st.metric("👥 Gem. Spelers", f"{avg_players:.0f}")
+        
+        # Visualisaties
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Intensiteit distributie
+            intensity_data = execute_db_query("""
+                SELECT datum, intensiteit_gemiddeld, naam
+                FROM session_plans 
+                WHERE datum >= ?
+                ORDER BY datum
+            """, (start_date,))
+            
+            if intensity_data:
+                df_intensity = pd.DataFrame(intensity_data, columns=['Datum', 'Intensiteit', 'Naam'])
+                df_intensity['Datum'] = pd.to_datetime(df_intensity['Datum'])
+                
+                fig_intensity = px.line(df_intensity, x='Datum', y='Intensiteit',
+                                      title="Intensiteit Trend",
+                                      hover_data=['Naam'])
+                fig_intensity.add_hline(y=7, line_dash="dash", line_color="red", 
+                                      annotation_text="Hoge Intensiteit")
+                fig_intensity.add_hline(y=5, line_dash="dash", line_color="orange", 
+                                      annotation_text="Gemiddelde Intensiteit")
+                st.plotly_chart(fig_intensity, use_container_width=True)
+        
+        with col2:
+            # Doelgroep verdeling
+            doelgroep_data = execute_db_query("""
+                SELECT doelgroep, COUNT(*) as aantal
+                FROM session_plans 
+                WHERE datum >= ?
+                GROUP BY doelgroep
+            """, (start_date,))
+            
+            if doelgroep_data:
+                df_doelgroep = pd.DataFrame(doelgroep_data, columns=['Doelgroep', 'Aantal'])
+                
+                fig_doelgroep = px.pie(df_doelgroep, values='Aantal', names='Doelgroep',
+                                     title="Sessions per Doelgroep")
+                st.plotly_chart(fig_doelgroep, use_container_width=True)
+        
+        # Meest gebruikte drills
+        st.markdown("#### 📈 Meest Gebruikte Drills")
+        
+        popular_drills = execute_db_query("""
+            SELECT dl.naam, dl.categorie, COUNT(*) as gebruik_aantal,
+                   AVG(sd.duur_minuten) as gem_duur
+            FROM session_drills sd
+            JOIN drill_library dl ON sd.drill_id = dl.drill_id
+            JOIN session_plans sp ON sd.session_id = sp.session_id
+            WHERE sp.datum >= ?
+            GROUP BY dl.drill_id, dl.naam, dl.categorie
+            ORDER BY gebruik_aantal DESC
+            LIMIT 10
+        """, (start_date,))
+        
+        if popular_drills:
+            df_popular = pd.DataFrame(popular_drills, columns=['Drill', 'Categorie', 'Gebruik', 'Gem. Duur'])
+            
+            fig_popular = px.bar(df_popular, x='Drill', y='Gebruik',
+                                color='Categorie', title="Top 10 Meest Gebruikte Drills")
+            fig_popular.update_xaxis(tickangle=45)
+            st.plotly_chart(fig_popular, use_container_width=True)
+            
+            # Tabel met details
+            st.dataframe(df_popular, use_container_width=True)
+        
+        # Focus thema analyse
+        st.markdown("#### 🎯 Focus Thema Analyse")
+        
+        # Parse focus themas (simpele implementatie)
+        focus_analysis = execute_db_query("""
+            SELECT focus_themas, COUNT(*) as aantal
+            FROM session_plans 
+            WHERE datum >= ? AND focus_themas IS NOT NULL AND focus_themas != ''
+            GROUP BY focus_themas
+            ORDER BY aantal DESC
+            LIMIT 8
+        """, (start_date,))
+        
+        if focus_analysis:
+            df_focus = pd.DataFrame(focus_analysis, columns=['Focus Thema', 'Aantal Sessions'])
+            
+            fig_focus = px.bar(df_focus, x='Focus Thema', y='Aantal Sessions',
+                             title="Meest Getrainde Focus Thema's")
+            fig_focus.update_xaxes(tickangle=45)
+            st.plotly_chart(fig_focus, use_container_width=True)
+    
+    else:
+        st.info(f"📭 Geen session data beschikbaar voor {analysis_period.lower()}")
+
+with tab5:
+    st.markdown("### ⚙️ Drill Management")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("#### ➕ Nieuwe Drill Toevoegen")
+        
+        with st.form("nieuwe_drill"):
+            drill_naam = st.text_input("📝 Drill Naam")
+            
+            col_a, col_b = st.columns(2)
+            with col_a:
+                drill_categorie = st.selectbox("📂 Categorie", 
+                                             ["Techniek", "Tactiek", "Fysiek", "Spelvormen", "Opwarming", "Cooling_down"])
+                drill_fase = st.selectbox("⚽ Focus Fase", 
+                                        ["Aanval", "Verdediging", "Omschakeling", "Algemeen"])
+            
+            with col_b:
+                drill_spelers_min = st.number_input("👥 Min Spelers", min_value=1, max_value=30, value=8)
+                drill_spelers_max = st.number_input("👥 Max Spelers", min_value=1, max_value=30, value=16)
+            
+            col_c, col_d = st.columns(2)
+            with col_c:
+                drill_duur = st.number_input("⏱️ Duur (minuten)", min_value=5, max_value=60, value=15)
+                drill_intensiteit = st.slider("⚡ Intensiteit", 1, 10, 5)
+            
+            with col_d:
+                drill_materiaal = st.text_input("🎒 Materiaal", placeholder="bijv. 4 pionnen, 2 ballen")
+                drill_veld = st.text_input("📐 Veld Afmetingen", placeholder="bijv. 20x15 meter")
+            
+            drill_beschrijving = st.text_area("📋 Beschrijving")
+            drill_instructies = st.text_area("📝 Instructies")
+            drill_coaching = st.text_area("🎯 Coaching Punten")
+            drill_variaties = st.text_area("🔄 Variaties")
+            
+            submitted = st.form_submit_button("✅ Drill Toevoegen")
+            
+            if submitted and drill_naam:
+                execute_db_query("""
+                    INSERT INTO drill_library 
+                    (drill_id, naam, categorie, focus_fase, spelers_min, spelers_max, 
+                     duur_minuten, intensiteit_niveau, materiaal, veld_afmetingen,
+                     beschrijving, instructies, coaching_punten, variaties)
+                    VALUES (nextval('drill_id_seq'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (drill_naam, drill_categorie, drill_fase, drill_spelers_min, drill_spelers_max,
+                      drill_duur, drill_intensiteit, drill_materiaal, drill_veld,
+                      drill_beschrijving, drill_instructies, drill_coaching, drill_variaties))
+                
+                st.success(f"✅ Drill '{drill_naam}' toegevoegd!")
+                st.rerun()
+    
+    with col2:
+        st.markdown("#### 📊 Drill Library Statistieken")
+        
+        # Statistieken
+        drill_stats = (lambda result: result[0] if result else None)(execute_db_query("""
+            SELECT 
+                COUNT(*) as total_drills,
+                COUNT(DISTINCT categorie) as categories,
+                AVG(duur_minuten) as avg_duration,
+                AVG(intensiteit_niveau) as avg_intensity
+            FROM drill_library
+        """))
+        
+        if drill_stats:
+            total_drills, categories, avg_duration, avg_intensity = drill_stats
+            
+            st.metric("📚 Totaal Drills", int(total_drills))
+            st.metric("📂 Categorieën", int(categories))
+            st.metric("⏱️ Gem. Duur", f"{avg_duration:.0f} min")
+            st.metric("⚡ Gem. Intensiteit", f"{avg_intensity:.1f}/10")
+        
+        # Categorie verdeling
+        category_stats = execute_db_query("""
+            SELECT categorie, COUNT(*) as aantal
+            FROM drill_library
+            GROUP BY categorie
+            ORDER BY aantal DESC
+        """)
+        
+        if category_stats:
+            df_categories = pd.DataFrame(category_stats, columns=['Categorie', 'Aantal'])
+            
+            fig_categories = px.pie(df_categories, values='Aantal', names='Categorie',
+                                  title="Drills per Categorie")
+            st.plotly_chart(fig_categories, use_container_width=True)
+    
+    # Drill management tabel
+    st.markdown("#### 📋 Alle Drills Beheren")
+    
+    all_drills = execute_db_query("""
+        SELECT drill_id, naam, categorie, focus_fase, duur_minuten, intensiteit_niveau
+        FROM drill_library
+        ORDER BY categorie, naam
+    """)
+    
+    if all_drills:
+        df_all_drills = pd.DataFrame(all_drills, columns=[
+            'ID', 'Naam', 'Categorie', 'Fase', 'Duur (min)', 'Intensiteit'
+        ])
+        
+        # Selecteerbare drill management
+        selected_drill = st.selectbox("🎯 Selecteer Drill om te Bewerken", 
+                                    [f"{row['Naam']} ({row['Categorie']})" for _, row in df_all_drills.iterrows()])
+        
+        if selected_drill:
+            drill_name = selected_drill.split(' (')[0]
+            selected_drill_id = df_all_drills[df_all_drills['Naam'] == drill_name]['ID'].iloc[0]
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("✏️ Bewerken", key=f"edit_{selected_drill_id}"):
+                    st.info("💡 Edit functionaliteit kan hier geïmplementeerd worden")
+            
+            with col2:
+                if st.button("🗑️ Verwijderen", key=f"delete_{selected_drill_id}"):
+                    # Check of drill gebruikt wordt in sessions
+                    usage_count = (lambda result: result[0] if result else None)(execute_db_query("""
+                        SELECT COUNT(*) FROM session_drills WHERE drill_id = ?
+                    """, (selected_drill_id,)))[0]
+                    
+                    if usage_count > 0:
+                        st.warning(f"⚠️ Drill wordt gebruikt in {usage_count} session(s). Verwijdering niet mogelijk.")
+                    else:
+                        execute_db_query("DELETE FROM drill_library WHERE drill_id = ?", (selected_drill_id,))
+                        st.success("✅ Drill verwijderd!")
+                        st.rerun()
+        
+        # Toon tabel
+        st.dataframe(df_all_drills, use_container_width=True)
+    
+    else:
+        st.info("📭 Nog geen drills in de library")
+
+# Database cleanup
+# Safe database connection cleanup
+# Database cleanup handled by Supabase helpers
