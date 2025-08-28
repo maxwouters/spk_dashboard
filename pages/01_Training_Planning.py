@@ -497,9 +497,9 @@ else:
     with col1:
         st.markdown("### 📊 Trainingsintensiteit")
         if base_column == "TrueVIFT":
-            percentage = st.slider("Percentage van MAS", min_value=70, max_value=120, value=100, step=5)
+            percentage = st.slider("Percentage van MAS", min_value=70, max_value=150, value=100, step=5)
         else:
-            percentage = st.slider("Percentage van VO2Max", min_value=70, max_value=120, value=100, step=5)
+            percentage = st.slider("Percentage van VO2Max", min_value=70, max_value=150, value=100, step=5)
         
         st.markdown("### ⏱️ Interval configuratie")
         intervalduur = st.number_input("Interval duur (seconden)", min_value=1, max_value=300, value=15, step=5)
