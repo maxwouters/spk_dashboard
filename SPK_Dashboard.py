@@ -111,6 +111,7 @@ if __name__ == "__main__":
         
         "🏃‍♂️ Fysieke Training": [
             st.Page("pages/Fysieke Training Analyse.py", title="Fysieke Analyse", icon="🔬"),
+            st.Page("pages/Wedstrijdvoorbereiding Analyse.py", title="Wedstrijdvoorbereiding", icon="⚽"),
             st.Page("pages/Fysieke Data Import.py", title="Data Import", icon="📊"),
             st.Page("pages/01_Training_Planning.py", title="Loopvorm Planner", icon="🎯")
         ],
